@@ -7,7 +7,9 @@ Excel のシートに空力・エンジン特性などの数値テーブルを�
 - `src/utils/excel_io.py`：計算結果をExcelへ出力し、`np.nan`/`np.inf` を `=NA()` に変換する `write_excel_result`。
 - `src/main.py`：Excel のボタンから呼び出す実装例。2つの補間関数の交点 `f(x) - g(x) = 0` も扱います。
 
-**この版（v4）の変更点**：`write_excel_result()` を新設し、求根だけでなく補間・性能計算など、すべての出力に対して非有限値を Excel の `#N/A` として書き込めます。`src/main.py` でもこの関数を使用します。`EquationSolver.solve()` は**未収束時に例外を投げる代わりに、既定で `result.x = np.nan` を返します**。連立の場合は要素がすべて `np.nan` の配列になります。`result.converged` で成否を必ず確認してください。例外が必要なら `raise_on_failure=True` を指定します。
+**v5 の追加変更**：`ExcelInterpolator` が Excel の `=NA()` / `#N/A` / 空欄 / `np.nan` を出力列ごとに除外して補間モデルを構築します。ある行の `Cm` だけ欠損していても、同じ行の `CL`・`CD` のデータは保持します。詳しくは **2.6 欠損値の扱い**を参照してください。
+
+**v4 の変更点**：`write_excel_result()` を新設し、求根だけでなく補間・性能計算など、すべての出力に対して非有限値を Excel の `#N/A` として書き込めます。`src/main.py` でもこの関数を使用します。`EquationSolver.solve()` は**未収束時に例外を投げる代わりに、既定で `result.x = np.nan` を返します**。連立の場合は要素がすべて `np.nan` の配列になります。`result.converged` で成否を必ず確認してください。例外が必要なら `raise_on_failure=True` を指定します。
 
 ## 1. ファイル構成とインストール
 
@@ -68,7 +70,7 @@ End Sub
 
 - ヘッダーは開始セルから右に連続し、データはヘッダーの次の行から下に連続すること。表の途中に完全空白行を入れないこと。
 - 列名は重複不可。`input_columns` / `output_columns` は Excel のヘッダー名と**完全一致**させること。
-- 対象となる列の値は数値のみ。欠損・文字列・NaN・無限大は許可しません。
+- 出力列は数値のほか `=NA()`、`#N/A`、空欄、`np.nan` を許可します。**欠損は出力列ごとに除外**され、他の出力の有効データは残ります。入力列に欠損がある行は全出力で除外します。任意の文字列や無限大はエラーです。
 - 入力座標の組合せが重複しているとエラーになります。変化しない入力列も指定できません。
 - 保存済みファイルを読み込む場合は `.xlsx` / `.xlsm` に対応します。`.xls` は未対応です。
 
@@ -140,7 +142,7 @@ aero = ExcelInterpolator(
 
 | `method` | SciPy | 想定するデータ | 注意点 |
 |---|---|---|---|
-| `"regular_grid"` | `RegularGridInterpolator` | 直交格子（全組合せがある） | 欠損格子があるとエラー。格子間隔は不等間隔でも可 |
+| `"regular_grid"` | `RegularGridInterpolator` | 直交格子（全組合せがある） | **入力座標の格子点そのものが不足する場合**はエラー。ある出力値だけ `#N/A` の場合は、その出力のみ散在点補間に切替 |
 | `"rbf"` | `RBFInterpolator` | 不規則に分布する散在点 | 距離を使うため内部で min–max 正規化。多数点では計算負荷に注意 |
 | `"linear_nd"` | `LinearNDInterpolator` | 2次元以上の散在点 | 凸包外は評価不可（NaNとなり、クラスからValueError） |
 | `"nearest_nd"` | `NearestNDInterpolator` | 散在点の最近傍 | 値は段階的に変化する。入力の正規化あり |
@@ -212,9 +214,65 @@ aero.reload()
 
 スカラー値と配列値は NumPy のブロードキャスト規則に従って組み合わせられます。`predict()` は**常に列名をキーとする辞書**を返します（スカラー入力なら値は `float`、配列入力なら `ndarray`）。`aero(...)` と直接呼び出す方法も `predict()` と同等です。
 
-範囲外について：`check_bounds=True` は**各入力変数の最小～最大の箱型範囲**だけを検査します。散在点で定義される多次元の凸包外を完全に判定する機能ではありません。`linear_nd` は凸包外がNaNになればValueErrorを発生させます。`check_bounds=False` では補間方式に応じて外挿が行われますが、物理的妥当性は保証しません。
+範囲外について：`check_bounds=True` は**各入力変数の最小～最大の箱型範囲**だけを検査します。散在点で定義される多次元の凸包外を完全に判定する機能ではありません。`linear_nd` は全データが揃っている場合、凸包外がNaNになればValueErrorを発生させます。**欠損値を除外した列**では、残った点の凸包外で `np.nan` を返すことがあります。`check_bounds=False` では補間方式に応じて外挿が行われますが、物理的妥当性は保証しません。
 
-エラー例：列名違い、入力座標の重複、数値以外・欠損、規則格子の欠損、評価点の範囲外、必要点数不足、データが一次元部分空間に偏ることによるSciPyの失敗など。
+エラー例：列名違い、入力座標の重複、NA() 以外の不正な文字列、入力格子の欠落、評価点の範囲外、データが低次元部分空間に偏ることによるSciPyの失敗など。**一部出力の有効点が足りない場合、その出力だけ `np.nan` を返します**。
+
+## 2.6 `=NA()` / `#N/A` / `np.nan` を含むシートの扱い（v5）
+
+例えば「空力DB」に次の表があるとします。
+
+| AOA | CL | CD | Cm |
+|---:|---:|---:|---:|
+| 0 | 0.0 | 0.010 | 0.05 |
+| 1 | 0.1 | 0.011 | `=NA()` |
+| 2 | 0.2 | 0.014 | 0.03 |
+| 3 | 0.3 | 0.019 | 0.02 |
+
+`Cm` のセルは Excel 上では **`#N/A`** と表示されます。v5 の `ExcelInterpolator` はこの行をまるごと捨てず、**CL と CD の4点はそのまま使用し、Cm は3点だけで補間します。**
+
+```python
+from utils.interpolation import ExcelInterpolator
+from utils.excel_io import write_excel_result
+
+# Excel から RunPython で呼び出したブックが wb として取得済みと仮定
+interp = ExcelInterpolator(
+    excel_path=wb.fullname,
+    sheet_name="空力DB",
+    input_columns=["AOA"],
+    output_columns=["CL", "CD", "Cm"],
+    method="pchip",
+    workbook=wb,
+)
+
+print(interp.n_points_by_output)
+# {'CL': 4, 'CD': 4, 'Cm': 3}
+
+result = interp.predict(AOA=1.0)
+# result['CL'] = 0.1
+# result['CD'] = 0.011
+# result['Cm'] は残った3点から補間した値（この例では 0.04）
+
+ws = wb.sheets["計算結果"]
+write_excel_result(ws, "B2", [result["CL"], result["CD"], result["Cm"]])
+```
+
+**欠損値の判定と扱い**
+
+- 対応：Excel の `=NA()`、計算済みエラー値 `#N/A`、空欄、Python の `np.nan`、および文字列 `"NA()"`。出力列で見つけたときはその出力の学習点だけを除きます。
+- `AOA`、`Mach` など **入力列** に欠損がある場合は、座標を定義できないためその行を全出力から除きます。
+- `"abc"` や `#VALUE!` など、認めていない文字列・エラーは勝手に欠損扱いにせず `ValueError` にします。
+- 出力列で残った点数が不足する、または全点が `#N/A` の場合でも**他の出力のモデルは使用可能**です。その列の `predict()` は `np.nan` を返します。Excelへ `write_excel_result()` で保存すると `=NA()`、表示は `#N/A` となります。
+- `interp.n_points_by_output` で各出力に使った有効点数、`interp.output_status` で `"complete"`（欠損なし）／`"partial"`（一部欠損）／`"unavailable"`（補間不可）を確認できます。`interp.n_dropped_input_rows` は入力座標欠損で除外した行数です。
+
+**補間方式による注意**
+
+- `"rbf"`、`"pchip"`、`"linear_nd"`、`"nearest_nd"`：各出力列の有効点だけを使用します。RBFなどの入力正規化は従来どおりクラス内部で実行します。
+- `"regular_grid"`：すべての入力座標組合せがシート上に存在する必要があります。**欠損のない出力**は `RegularGridInterpolator` を継続使用します。一方、**欠損のある出力**は、2次元以上なら `grid_method="nearest"` 時に最近傍補間、それ以外は `LinearNDInterpolator` に切り替えます。1次元では有効点を使って線形または最近傍補間します。つまり、`grid_method="cubic"` 等を指定していても、欠損列だけは区分線形補間になります。
+- 欠損がある出力では、有効点の凸包外・範囲外に値を決められない場合、`np.nan` を返すことがあります。**欠損座標に必ず数値を補完できるわけではありません。** 物理的に不適切な外挿を避けるためです。
+- 補間に使った点が足りず `np.nan` になった場合、その原因は `output_status` と `n_points_by_output` で確認してください。NaNが多い列の結果をトリム計算へ渡す場合は、特に事前チェックを推奨します。
+
+保存済み `.xlsx` / `.xlsm` で `=NA()` があると、`openpyxl` の `data_only=True` は保存時の計算キャッシュを読みます。キャッシュがない数式セルは `None` として扱われ、欠損になります。Excelを開いた状態なら `workbook=wb` を渡してExcelの現在値を使用できます。
 
 ---
 
@@ -486,7 +544,7 @@ python -m compileall -q src tests
 
 ---
 
-# 5. `excel_io.py`：計算結果をExcelに書き込む共通関数
+# 6. `excel_io.py`：計算結果をExcelに書き込む共通関数
 
 計算結果をExcelに書き込むときは、**補間結果か求根結果かを区別せず**、
 `write_excel_result()` を使用してください。これでPythonの `np.nan` をExcelの
