@@ -144,7 +144,13 @@ def run_ps_contours() -> None:
     """Excelのボタン用: 31_PsMapの長形式データからG固定のPs等値線を更新。
 
     31_PsMap: A1から [Altitude, Mach, G, Ps] （行順自由）
-    33_Ps等値線設定: B2 = G固定値, B3 = レベルのCSV文字列（例: 0,10,20）
+    33_Ps等値線設定: B2 = 固定値CSV（例: 1.0 / 1.0,120）
+                     B3 = 等値線の数値（例: 0,10,20）
+                     B5 = fixed_mode, B6 = resample
+                     B7 = 固定列名CSV（例: G / G,Weight）
+                     B8 = 等値線にする列名（例: Ps）
+                     B9 = 横軸列名（例: Mach）
+                     B10 = 縦軸列名（例: Altitude）
     32_Ps等値線データ: 等値線XY座標の自動出力専用シート
     40_グラフ: Ps_contour_chart が生成/更新される
 
@@ -161,7 +167,11 @@ def run_ps_contours() -> None:
         pd.DataFrame, index=False, expand="table"
     ).value
     config = wb.sheets["33_Ps等値線設定"]
-    g = float(config.range("B2").value)
+    fixed_columns = [s.strip() for s in str(config.range("B7").value or "G").split(",")]
+    fixed_values = [float(s.strip()) for s in str(config.range("B2").value).split(",")]
+    level_column = str(config.range("B8").value or "Ps").strip()
+    x_column = str(config.range("B9").value or "Mach").strip()
+    y_column = str(config.range("B10").value or "Altitude").strip()
     levels = [float(s.strip()) for s in str(config.range("B3").value).split(",")]
     fixed_mode = str(config.range("B5").value or "exact").strip().lower()
     resample = str(config.range("B6").value or "none").strip().lower()
@@ -169,15 +179,16 @@ def run_ps_contours() -> None:
     try:
         lines = update_contour_chart_from_dataframe(
             wb, data,
-            fixed_value=g,
-            levels=levels,
+            fixed_columns=fixed_columns, fixed_values=fixed_values,
+            level_column=level_column, levels=levels,
+            x_column=x_column, y_column=y_column,
             fixed_mode=fixed_mode,
             resample=resample,
             output_data_sheet="32_Ps等値線データ",
             chart_sheet="40_グラフ",
             chart_name="Ps_contour_chart",
         )
-        n_branches = lines.groupby(["Ps_level", "segment_id"]).ngroups
+        n_branches = lines.groupby([f"{level_column}_level", "segment_id"]).ngroups
         config.range("B4").value = f"完了: {len(levels)}レベル / {n_branches}曲線"
         wb.app.calculate()
     except Exception as exc:

@@ -1,4 +1,4 @@
-# My Tool
+# Excel + Python 航空機性能推算：構成例
 
 **目的**：Excel (`.xlsm`) を入力・特性DB・結果表・グラフに使い、Pythonを補間・求根・性能計算のエンジンにする。
 
@@ -8,7 +8,7 @@
 
 ```mermaid
 flowchart LR
-  E["Excel：Performance.xlsm<br/>・00_計算管理（実行ボタン）<br/>・01_機体諸元 / 03_飛行条件<br/>・10_空力DB / 11_推進DB<br/>・30_TV / 31_Ps（結果表・グラフ）"]
+  E["Excel：AircraftPerformance.xlsm<br/>・00_計算管理（実行ボタン）<br/>・01_機体諸元 / 03_飛行条件<br/>・10_空力DB / 11_推進DB<br/>・30_TV / 31_Ps（結果表・グラフ）"]
   P["Python：src/<br/>・main.py（実行管理）<br/>・models/aerodynamics.py・propulsion.py<br/>・analysis/performance_maps.py<br/>・utils/interpolation.py・solvers.py・excel_io.py"]
   E -->|"RunPython / 入力条件・特性データ"| P
   P -->|"計算結果 / 状態・残差 / 保存"| E
@@ -17,8 +17,8 @@ flowchart LR
 ## 2. フォルダ構造
 
 ```text
-Performance/
-├── Performance.xlsm      # 利用者が用意（このZIPには含めない）
+AircraftPerformance/
+├── AircraftPerformance.xlsm      # 利用者が用意（このZIPには含めない）
 ├── src/
 │   ├── main.py                  # RunPythonからの入口
 │   ├── legacy_examples.py       # 過去のmain.run() 等の互換用
@@ -84,7 +84,7 @@ df = calculate_tv_ps(
 
 ## 4. Excel側の実行ボタン
 
-`Performance.xlsm` の標準モジュールに以下を登録し、フォームコントロールのボタンに割り当てます。
+`AircraftPerformance.xlsm` の標準モジュールに以下を登録し、フォームコントロールのボタンに割り当てます。
 
 ```vb
 Sub RunMaps()
@@ -94,7 +94,7 @@ End Sub
 
 xlwingsアドイン（またはStandalone VBAモジュール）の設定で、**PYTHONPATHにこのプロジェクトの `src` フォルダ**を設定してください。
 
-例：`C:\Performance\src`
+例：`C:\AircraftPerformance\src`
 
 `xw.Book.caller()` がボタンを押したブックを参照するため、Excelパスを `main.py` に固定する必要はありません。Python環境の配置と実行権限、xlwingsアドインまたはStandaloneモジュール、マクロ許可は別途必要です。
 
@@ -160,7 +160,7 @@ python -m pytest -q tests/
 ## 9. ExcelからPythonを起動する：アドイン不要の2方式（Windows版Excel）
 
 この節は、**Excelのボタンを押してPythonを動かし、T–V / Psの数値表をExcelに保存するまで**の再現手順です。
-`Performance.xlsm` は利用者が作成します（この配布物には空の `.xlsm` を含めていません）。
+`AircraftPerformance.xlsm` は利用者が作成します（この配布物には空の `.xlsm` を含めていません）。
 
 ### 9.1 どちらを選ぶか
 
@@ -184,8 +184,8 @@ Python実行環境は各PCに必要で、VBAと外部プログラム実行が会
 #### 共通：プロジェクト配置
 
 ```text
-C:\Performance\
-├── Performance.xlsm
+C:\AircraftPerformance\
+├── AircraftPerformance.xlsm
 ├── .venv\                     # Pythonの仮想環境（利用者が作成）
 │   └── Scripts\python.exe
 ├── src\
@@ -205,7 +205,7 @@ C:\Performance\
 **共通の初期セットアップ：** Windowsの**コマンドプロンプト（cmd.exe）**で実行します。例ではWindowsの`py`コマンドを使います。
 
 ```bat
-cd /d C:\Performance
+cd /d C:\AircraftPerformance
 py -m venv .venv
 REM 方式Aの場合
 .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -225,32 +225,32 @@ xlwings公式の `--standalone` は、Excelアドインの代わりになるVBA�
 **手順 A-1. Standaloneの雛形を生成する**
 
 ```bat
-cd /d C:\Performance
+cd /d C:\AircraftPerformance
 .venv\Scripts\xlwings.exe quickstart StandaloneSeed --standalone
 ```
 
-`StandaloneSeed\StandaloneSeed.xlsm` などが生成されます。これは**既存の `Performance.xlsm` を上書きするコマンドではありません**。既存ブックに組み込むための雛形です。
+`StandaloneSeed\StandaloneSeed.xlsm` などが生成されます。これは**既存の `AircraftPerformance.xlsm` を上書きするコマンドではありません**。既存ブックに組み込むための雛形です。
 
 **手順 A-2. 内蔵VBAモジュールを既存ブックに移す**
 
-1. `StandaloneSeed.xlsm` と `Performance.xlsm` を **Windows版Excel** で開く。
+1. `StandaloneSeed.xlsm` と `AircraftPerformance.xlsm` を **Windows版Excel** で開く。
 2. `Alt + F11` でVBAエディターを開く。
 3. 左のプロジェクトエクスプローラーで雛形ブックの標準モジュールを確認し、xlwings用のモジュールを右クリックして **[ファイルのエクスポート]** で `.bas` を書き出す。
-4. `Performance.xlsm` のプロジェクトを選び **[ファイル] → [ファイルのインポート]** で、その `.bas` を組み込む（同名モジュールが既にある場合は重複させない）。
+4. `AircraftPerformance.xlsm` のプロジェクトを選び **[ファイル] → [ファイルのインポート]** で、その `.bas` を組み込む（同名モジュールが既にある場合は重複させない）。
 5. 雛形に含まれる専用の補助モジュールやクラスがあれば、それも必要に応じて移す。Windows版では通常は独立したVBAモジュールで利用できる。
-6. `Performance.xlsm` を保存する。**.xlsmのまま保存**すること。
+6. `AircraftPerformance.xlsm` を保存する。**.xlsmのまま保存**すること。
 
-> 新規作成なら `StandaloneSeed.xlsm` を `Performance.xlsm` にリネームし、シートを追加して使い始めるほうが簡単です。既存ブックを使用する場合のみモジュール移植が必要です。
+> 新規作成なら `StandaloneSeed.xlsm` を `AircraftPerformance.xlsm` にリネームし、シートを追加して使い始めるほうが簡単です。既存ブックを使用する場合のみモジュール移植が必要です。
 
 **手順 A-3. Pythonの場所とソースコードの場所を設定する**
 
-`Performance.xlsm` に `xlwings.conf` という名前のワークシートを作り、次の2列で設定します。
+`AircraftPerformance.xlsm` に `xlwings.conf` という名前のワークシートを作り、次の2列で設定します。
 （雛形の `_xlwings.conf` シートを利用する場合は、先頭の `_` を削除して `xlwings.conf` に変更してください。）
 
 | A列（設定キー） | B列（値の例） |
 |---|---|
-| `INTERPRETER_WIN` | `C:\Performance\.venv\Scripts\python.exe` |
-| `PYTHONPATH` | `C:\Performance\src` |
+| `INTERPRETER_WIN` | `C:\AircraftPerformance\.venv\Scripts\python.exe` |
+| `PYTHONPATH` | `C:\AircraftPerformance\src` |
 
 パスは**実際に配置したフォルダ**に変更します。仮想環境以外のPythonを使う場合は、その `python.exe` の実パスにします。ブックを別の場所に移動したら設定の変更が必要になることがあります。
 
@@ -302,27 +302,27 @@ VBAが `python.exe` を直接実行し、保存済みの `.xlsm` を `openpyxl` 
 9.1の構成にしたうえで、次を確認します。
 
 ```bat
-C:\Performance\.venv\Scripts\python.exe
-C:\Performance\src\run_without_xlwings.py
+C:\AircraftPerformance\.venv\Scripts\python.exe
+C:\AircraftPerformance\src\run_without_xlwings.py
 ```
 
 `src/run_without_xlwings.py` は**この配布物に含まれる**ため、新たに作る必要はありません。
 
 **手順 B-2. コマンドプロンプトで単独実行を確認する**
 
-一度Excelで `Performance.xlsm` を**保存**してから、次を実行します。
+一度Excelで `AircraftPerformance.xlsm` を**保存**してから、次を実行します。
 
 ```bat
-cd /d C:\Performance
-.venv\Scripts\python.exe src\run_without_xlwings.py Performance.xlsm results_manual.xlsx
+cd /d C:\AircraftPerformance
+.venv\Scripts\python.exe src\run_without_xlwings.py AircraftPerformance.xlsm results_manual.xlsx
 ```
 
-成功すると、`results_manual.xlsx` に `30_TV`、`31_Ps`、`00_計算管理` の結果シートが生成されます。元の `Performance.xlsm` はPythonから**上書きしません**。
+成功すると、`results_manual.xlsx` に `30_TV`、`31_Ps`、`00_計算管理` の結果シートが生成されます。元の `AircraftPerformance.xlsm` はPythonから**上書きしません**。
 エラー時は `results_manual.error.txt` に詳細が記録されます。
 
 **手順 B-3. VBAモジュールを取り込む**
 
-`excel_vba/RunMaps_without_xlwings.bas` を、`Alt + F11 → ファイル → ファイルのインポート` で `Performance.xlsm` に追加します。
+`excel_vba/RunMaps_without_xlwings.bas` を、`Alt + F11 → ファイル → ファイルのインポート` で `AircraftPerformance.xlsm` に追加します。
 このモジュールは**xlwingsの関数を使いません**。
 コード内で呼ぶコマンドの中心は次のとおりです。
 
@@ -365,7 +365,7 @@ Python側は `openpyxl.load_workbook(path, data_only=True)` を使うため、Ex
 
 **手順：**
 
-1. `Performance.xlsm` をExcelで開きます。**デスクトップ版**を使用してください。
+1. `AircraftPerformance.xlsm` をExcelで開きます。**デスクトップ版**を使用してください。
 2. `[ファイル] → [オプション] → [リボンのユーザー設定]` で `[開発]` にチェックを入れます。
 3. `Alt + F11` でVBAエディターを開き、方式AまたはBのマクロが標準モジュールに登録されているか確認します。
 4. Excelの `00_計算管理` シートへ戻り、`[開発] → [挿入] → [フォームコントロール] → [ボタン]` を選びます。
@@ -650,7 +650,7 @@ flowchart LR
 | シート | 用途 | 列／セル |
 |---|---|---|
 | `31_PsMap` | **元のPs数値データ**。各Gの値を同じ表に保持 | A1から `Altitude`, `Mach`, `G`, `Ps` |
-| `33_Ps等値線設定` | 等値線の条件 | B2=固定G（例：1）、B3=レベル文字列（例：`0,10,20`）、B4=実行状態、B5=`exact`または`linear`、B6=`none`または`linear` |
+| `33_Ps等値線設定` | 等値線の条件 | B2=固定値（例：`1.0`）、B3=等値線の数値（例：`0,10,20`）、B4=実行状態、B5=`exact`または`linear`、B6=`none`または`linear`、B7=固定列名（例：`G`）、B8=等値線の列名（例：`Ps`）、B9=横軸列名（例：`Mach`）、B10=縦軸列名（例：`Altitude`） |
 | `32_Ps等値線データ` | **自動生成専用**。等値線の各分離枝をX/Y 2列組で出力 | A1から自動更新。編集しないこと |
 | `40_グラフ` | ExcelネイティブXY散布図 | `Ps_contour_chart` が自動生成・更新 |
 
@@ -752,3 +752,103 @@ python examples/generate_ps_contours_demo.py
 
 主なAPI参考：ContourPy（`contour_generator(...).lines(level)`）、
 SciPy（`griddata(..., method='linear')`）、Plotly（`go.Scatter`／`go.Heatmap`）。
+
+
+## 13. 等値線の列名を自由に指定する（v8）
+
+### まず、`level_column` と `levels` は異なる
+
+- `fixed_columns=["G"]`：固定するデータ列名（複数可能）。
+- `fixed_values=[1.0]`：その固定列に対応する数値。
+- `level_column="Ps"`：**等値線の対象とする数値列名**（文字列で1つ指定）。
+- `levels=[0, 10, 20]`：**描く等値線の値**。列名ではなく数値リスト。
+- `x_column="Mach"`、`y_column="Altitude"`：グラフのX/Y座標の列名。
+
+従って、固定列を `["G"]` にするのは正しいですが、`levels=["Ps"]` ではありません。
+`level_column="Ps", levels=[0, 10, 20]` のように分けて指定します。
+
+### Excelグラフ版
+
+```python
+from utils.excel_charts import update_contour_chart_from_dataframe
+
+lines = update_contour_chart_from_dataframe(
+    wb,
+    df,                         # Altitude, Mach, G, Ps を含むDataFrame
+    fixed_columns=["G"],        # 何を固定するか：列名のリスト
+    fixed_values=[1.0],         # 固定値
+    level_column="Ps",          # 何の等値線か：列名
+    levels=[0, 10, 20],         # 等値線の数値
+    x_column="Mach",            # 横軸の列名
+    y_column="Altitude",        # 縦軸の列名
+    output_data_sheet="32_Ps等値線データ",
+    chart_sheet="40_グラフ",
+    chart_name="Ps_contour_chart",
+)
+```
+
+`df`の行順は自由。元データは`31_PsMap`シートの1枚に長形式で保持し、
+Pythonは条件に合う行を抽出して格子を組み、ContourPyで等値線を計算します。
+`levels=[0,10,20]` に一致する実測行がなくても描けます。
+
+### Plotly HTML版
+
+```python
+from utils.plotly_charts import export_isolines_html
+
+export_isolines_html(
+    df,
+    fixed_columns=["G"],
+    fixed_values=[1.0],
+    level_column="Ps",
+    levels=[0, 10, 20],
+    x_column="Mach",
+    y_column="Altitude",
+    output_html="reports/Ps_G1.html",
+    show_heatmap=True,
+)
+```
+
+### より簡単な辞書指定も可能
+
+```python
+# 列名と固定値を1セットで指定
+fixed={"G": 1.0}
+
+# 将来、重量も固定して表示する場合
+fixed={"G": 1.0, "Weight": 120.0}
+```
+
+これらは `fixed_columns` / `fixed_values` と**併用しません**。
+複数の固定列を指定する場合、現バージョンでは `fixed_mode="exact"` に限定します。
+1列の `fixed_mode="linear"` は従来どおり使えます。
+
+多次元データで軸に使わない独立変数が残っていると、同じ `(x, y)` に複数の値が重なるため、
+勝手に平均せずエラーとします。必要な変数をすべて固定してください。
+
+### Excel側の設定シート（`33_Ps等値線設定`）
+
+| セル | 入力例 | 意味 |
+|---|---|---|
+| B2 | `1.0` | 固定値。複数なら `1.0,120.0` のように入力 |
+| B3 | `0,10,20` | 等値線の数値レベル |
+| B4 | 自動入力 | 実行状態・完了メッセージ |
+| B5 | `exact` | 既存の断面を使う。`linear` は固定列1つだけ |
+| B6 | `none` | 再格子化なし。散在点なら `linear` を検討 |
+| B7 | `G` | 固定する列名。複数なら `G,Weight` |
+| B8 | `Ps` | 等値線の対象列名 |
+| B9 | `Mach` | 横軸の列名 |
+| B10 | `Altitude` | 縦軸の列名 |
+
+`src/main.py` の `run_ps_contours()` も上記のセルを参照するよう変更済み。
+B7～B10が空欄の場合は従来の `G` / `Ps` / `Mach` / `Altitude` を使います。
+既存のB2・B3・B5・B6の入力形式も維持しています。
+
+### 従来コードとの互換性・制約
+
+以前の `fixed_column="G", fixed_value=1.0, z_column="Ps"` も利用できます。
+2つ以上の固定列については、すべての固定値が元のデータ表に**存在**することが必要です。
+未計算の条件に対する2次元以上の多重補間は行いません。
+`resample="linear"` は高度/Machの2次元の再格子化であり、その他の固定変数に対する補間ではありません。
+NaN / `#N/A` 領域は原則マスクしますが、再格子化すると穴を埋める可能性があります。
+Excelグラフ用はWindows版ExcelのCOM APIを使用するため、Excel実機での確認が必要です。

@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,46 @@ class ContourGrid:
     z_column: str
     fixed_column: str
     fixed_value: float
+    fixed_conditions: tuple[tuple[str, float], ...] = ()
+
+
+def _resolve_fixed_conditions(
+    *,
+    fixed: Mapping[str, float] | None,
+    fixed_columns: Sequence[str] | None,
+    fixed_values: Sequence[float] | None,
+    fixed_column: str,
+    fixed_value: float,
+) -> tuple[tuple[str, float], ...]:
+    """旧式・辞書式・列名/値リスト式の固定条件を同一形式に正規化する。"""
+    if fixed is not None:
+        if fixed_columns is not None or fixed_values is not None:
+            raise ValueError("fixed と fixed_columns/fixed_values は併用できません")
+        if not isinstance(fixed, Mapping):
+            raise TypeError("fixedは列名と数値の辞書で指定してください")
+        items = list(fixed.items())
+    elif fixed_columns is not None or fixed_values is not None:
+        if fixed_columns is None or fixed_values is None:
+            raise ValueError("fixed_columnsとfixed_valuesを両方指定してください")
+        if isinstance(fixed_columns, str):
+            raise TypeError("fixed_columnsは列名のリストで指定してください")
+        items = list(zip(fixed_columns, fixed_values, strict=True))
+    else:
+        items = [(fixed_column, fixed_value)]
+    if not items:
+        raise ValueError("固定する列を1つ以上指定してください")
+    names = [name for name, _ in items]
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("固定する列名は空でない文字列で指定してください")
+    if len(names) != len(set(names)):
+        raise ValueError("固定する列名が重複しています")
+    try:
+        conditions = tuple((name, float(value)) for name, value in items)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("固定値は数値で指定してください") from exc
+    if not all(np.isfinite(value) for _, value in conditions):
+        raise ValueError("固定値は有限の数値で指定してください")
+    return conditions
 
 
 def _numbers(frame: pd.DataFrame, names: Sequence[str]) -> pd.DataFrame:
@@ -58,6 +98,10 @@ def prepare_contour_grid(
     *,
     fixed_column: str = "G",
     fixed_value: float = 1.0,
+    fixed: Mapping[str, float] | None = None,
+    fixed_columns: Sequence[str] | None = None,
+    fixed_values: Sequence[float] | None = None,
+    level_column: str | None = None,
     x_column: str = "Mach",
     y_column: str = "Altitude",
     z_column: str = "Ps",
@@ -69,7 +113,9 @@ def prepare_contour_grid(
 ) -> ContourGrid:
     """長形式データから1枚の x-y-z 格子断面を作る。
 
-    fixed_mode='exact': 指定Gが元データに存在する必要がある。
+    fixed={'G': 1.0}、または fixed_columns=['G'], fixed_values=[1.0] と指定可能。
+    level_column='Ps' は等値線対象のデータ列名。levels=[0, 10, 20] は等値線値。
+    fixed_mode='exact': 指定した固定値が元データに存在する必要がある。
     fixed_mode='linear': 指定Gがなくても、上下2つのG断面を補間する。
           ただし上下断面で同じ (x, y) 点が存在するところだけ評価できる。
           G方向の外挿はしない。
@@ -78,6 +124,16 @@ def prepare_contour_grid(
           データの凸包の外はNaN。穴を埋める処理をするため、欠損格子の
           意味が計算失敗/物理的に存在しない領域なら使用しないこと。
     """
+    conditions = _resolve_fixed_conditions(
+        fixed=fixed, fixed_columns=fixed_columns, fixed_values=fixed_values,
+        fixed_column=fixed_column, fixed_value=fixed_value,
+    )
+    if level_column is not None:
+        if not isinstance(level_column, str) or not level_column.strip():
+            raise ValueError("level_columnは空でない列名を指定してください")
+        z_column = level_column
+    if len(conditions) > 1 and fixed_mode == "linear":
+        raise ValueError("複数の固定列ではfixed_mode='exact'のみ対応します")
     if fixed_mode not in {"exact", "linear"}:
         raise ValueError("fixed_modeは'exact'または'linear'を指定してください")
     if resample not in {"none", "linear"}:
@@ -86,11 +142,22 @@ def prepare_contour_grid(
         raise ValueError("fixed_valueおよびtoleranceが不正です")
     if resample == "linear" and (nx < 2 or ny < 2):
         raise ValueError("nx, nyは2以上が必要です")
-    names = [fixed_column, x_column, y_column, z_column]
+    fixed_column, fixed_value = conditions[0]
+    names = [name for name, _ in conditions] + [x_column, y_column, z_column]
     if len(set(names)) != len(names):
-        raise ValueError("fixed/x/y/zの列名はすべて異なる必要があります")
+        raise ValueError("fixed/x/y/levelの列名はすべて異なる必要があります")
 
     frame = _numbers(data, names)
+    # 固定条件が複数の場合、最初の1列は従来の処理で選択し、
+    # その他の列はここで厳密に断面抽出する。行の並び順には依存しない。
+    for other_column, other_value in conditions[1:]:
+        values = np.sort(frame[other_column].dropna().unique())
+        near = values[np.isclose(values, other_value, rtol=0.0, atol=tolerance)]
+        if len(near) == 0:
+            raise ValueError(f"{other_column}={other_value} はありません。選択可能: {values.tolist()}")
+        if len(near) > 1:
+            raise ValueError(f"{other_column}の指定値付近に複数候補があります。toleranceを小さくしてください")
+        frame = frame.loc[frame[other_column] == near[0]].copy()
     frame = frame[frame[fixed_column].notna()].copy()
     distinct = np.sort(frame[fixed_column].unique())
     if len(distinct) == 0:
@@ -146,7 +213,7 @@ def prepare_contour_grid(
     if len(xs) < 2 or len(ys) < 2:
         raise ValueError("等値線を作成するにはx,y各2点以上が必要です")
     return ContourGrid(xs, ys, zs, x_column, y_column, z_column,
-                       fixed_column, float(fixed_value))
+                       fixed_column, float(fixed_value), conditions)
 
 
 def extract_contour_lines(grid: ContourGrid, *, levels: Sequence[float]) -> pd.DataFrame:
@@ -155,8 +222,11 @@ def extract_contour_lines(grid: ContourGrid, *, levels: Sequence[float]) -> pd.D
     戻り値: [fixed_column, <z_column>_level, segment_id, point_id,
              <x_column>, <y_column>]
     """
-    names = [grid.fixed_column, f"{grid.z_column}_level", "segment_id", "point_id",
-             grid.x_column, grid.y_column]
+    fixed_conditions = grid.fixed_conditions or ((grid.fixed_column, grid.fixed_value),)
+    names = [name for name, _ in fixed_conditions] + [
+        f"{grid.z_column}_level", "segment_id", "point_id",
+        grid.x_column, grid.y_column,
+    ]
     lev = [float(level) for level in levels]
     if len(lev) != len(set(lev)) or not lev or not np.isfinite(lev).all():
         raise ValueError("levelsは有限で重複のない1個以上の値を指定してください")
@@ -172,7 +242,7 @@ def extract_contour_lines(grid: ContourGrid, *, levels: Sequence[float]) -> pd.D
             if len(xy) < 2:
                 continue
             frames.append(pd.DataFrame({
-                grid.fixed_column: grid.fixed_value,
+                **dict(fixed_conditions),
                 f"{grid.z_column}_level": level,
                 "segment_id": segment_id,
                 "point_id": np.arange(len(xy)),

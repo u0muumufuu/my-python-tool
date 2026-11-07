@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, Mapping
 
 import numpy as np
 import pandas as pd
@@ -210,7 +210,12 @@ def build_isoline_figure(
                                   f"{grid.y_column}: %{{y:.4g}}<extra></extra>",
                 ))
     fig.update_layout(
-        title=title or f"{grid.z_column}等値線 ({grid.fixed_column}={grid.fixed_value:g})",
+        title=title or (
+            f"{grid.z_column}等値線 ("
+            + ", ".join(f"{name}={value:g}" for name, value in (
+                grid.fixed_conditions or ((grid.fixed_column, grid.fixed_value),)
+            )) + ")"
+        ),
         xaxis_title=grid.x_column,
         yaxis_title=grid.y_column,
         template="plotly_white",
@@ -221,10 +226,14 @@ def build_isoline_figure(
 def export_isolines_html(
     data: pd.DataFrame,
     *,
-    fixed_value: float,
+    fixed_value: float = 1.0,
     levels: Sequence[float],
     output_html: str | Path,
     fixed_column: str = "G",
+    fixed: Mapping[str, float] | None = None,
+    fixed_columns: Sequence[str] | None = None,
+    fixed_values: Sequence[float] | None = None,
+    level_column: str | None = None,
     x_column: str = "Mach",
     y_column: str = "Altitude",
     z_column: str = "Ps",
@@ -234,12 +243,18 @@ def export_isolines_html(
     show_heatmap: bool = False,
     **grid_options,
 ) -> Path:
-    """長形式データ1枚から任意の固定条件・等値線でオフラインHTML出力。"""
+    """長形式データから任意の固定列・等値線変数を選びHTMLへ出力。
+
+    例: fixed={'G': 1.0}, level_column='Ps', levels=[0,10,20]。
+    従来の fixed_column/fixed_value/z_column 指定とも互換。
+    """
     from .contour_maps import prepare_contour_grid, extract_contour_lines
 
     grid = prepare_contour_grid(
         data,
         fixed_column=fixed_column, fixed_value=fixed_value,
+        fixed=fixed, fixed_columns=fixed_columns, fixed_values=fixed_values,
+        level_column=level_column,
         x_column=x_column, y_column=y_column, z_column=z_column,
         fixed_mode=fixed_mode, resample=resample, **grid_options,
     )

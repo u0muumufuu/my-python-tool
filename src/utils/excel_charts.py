@@ -13,7 +13,7 @@ Excel実機の検証は各PC上で実行してください。Linux/macOSではCO
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Literal, Sequence, Mapping
 
 import pandas as pd
 from openpyxl.utils.cell import coordinate_from_string, column_index_from_string, get_column_letter
@@ -212,12 +212,16 @@ def update_contour_chart_from_dataframe(
     wb,
     data: pd.DataFrame,
     *,
-    fixed_value: float,
+    fixed_value: float = 1.0,
     levels: Sequence[float],
     output_data_sheet: str = "32_Ps等値線データ",
     chart_sheet: str = "40_グラフ",
     chart_name: str = "Ps_contour_chart",
     fixed_column: str = "G",
+    fixed: Mapping[str, float] | None = None,
+    fixed_columns: Sequence[str] | None = None,
+    fixed_values: Sequence[float] | None = None,
+    level_column: str | None = None,
     x_column: str = "Mach",
     y_column: str = "Altitude",
     z_column: str = "Ps",
@@ -228,6 +232,10 @@ def update_contour_chart_from_dataframe(
 ) -> pd.DataFrame:
     """長形式Ps表から等値線を抽出し、ExcelネイティブXY図を作成/更新する。
 
+    fixed_columns=['G'], fixed_values=[1.0] で固定列名を指定できる。
+    level_column='Ps' と levels=[0, 10, 20] は別々の指定。
+    fixed={'G': 1.0, 'Weight': 120.0} の辞書指定も可能。
+    従来の fixed_column='G', fixed_value=1.0, z_column='Ps' も使用可能。
     元データは変更せず、*専用の* output_data_sheet だけを更新する。
     配列長や等値線の数・分離枝の数が変わっても系列を作成/削除する。
     戻り値は縦長の等値線座標表（検証・CSV保存などに再利用可）。
@@ -241,12 +249,14 @@ def update_contour_chart_from_dataframe(
     grid = prepare_contour_grid(
         data,
         fixed_column=fixed_column, fixed_value=fixed_value,
+        fixed=fixed, fixed_columns=fixed_columns, fixed_values=fixed_values,
+        level_column=level_column,
         x_column=x_column, y_column=y_column, z_column=z_column,
         fixed_mode=fixed_mode, resample=resample, **grid_options,
     )
     lines = extract_contour_lines(grid, levels=levels)
     wide, definitions = contours_to_wide_table(
-        lines, x_column=x_column, y_column=y_column, z_column=z_column,
+        lines, x_column=grid.x_column, y_column=grid.y_column, z_column=grid.z_column,
     )
     if not definitions:
         raise ValueError("指定した等値線は計算領域内に存在しません。既存グラフは変更していません")
@@ -269,6 +279,9 @@ def update_contour_chart_from_dataframe(
     update_xy_chart(
         wb, chart_sheet=chart_sheet, chart_name=chart_name,
         series_specs=specs,
-        title=title or f"{z_column} contours: {fixed_column}={fixed_value:g}",
+        title=title or (
+            f"{grid.z_column} contours: "
+            + ", ".join(f"{name}={value:g}" for name, value in grid.fixed_conditions)
+        ),
     )
     return lines
