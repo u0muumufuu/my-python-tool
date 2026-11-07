@@ -196,3 +196,90 @@ def run_ps_contours() -> None:
         wb.save()
         raise
     wb.save()
+
+
+
+def export_demo_plotly_reports() -> None:
+    """ExcelのDBから補間確認用のPlotly HTMLを2本出力する例。
+
+    - reports/aerodynamics_report.html
+    - reports/propulsion_report.html
+
+    実運用では、plot_specs を自分の列名・固定条件に合わせて編集して使う。
+    """
+    import pandas as pd
+    import xlwings as xw
+    from pathlib import Path
+    from utils.plotly_charts import (
+        InterpolationPlotSpec,
+        export_interpolation_report_html,
+    )
+
+    wb = xw.Book.caller()
+    base = Path(wb.fullname).resolve().parent
+    reports_dir = base / "reports"
+    reports_dir.mkdir(exist_ok=True)
+
+    aero_model = AerodynamicsModel(excel_path=wb.fullname, workbook=wb)
+    aero_raw = wb.sheets["10_空力DB"].range("A1").options(
+        pd.DataFrame, index=False, expand="table"
+    ).value
+    aero_specs = [
+        InterpolationPlotSpec(
+            title="CL-α（Mach 別）",
+            x_column="alpha",
+            y_column="CL",
+            series_columns=["Mach"],
+            series_values=[0.2, 0.4],
+            x_range=(-5.0, 15.0),
+            x_samples=301,
+        ),
+        InterpolationPlotSpec(
+            title="CD-α（Mach 別）",
+            x_column="alpha",
+            y_column="CD",
+            series_columns=["Mach"],
+            series_values=[0.2, 0.4],
+            x_range=(-5.0, 15.0),
+            x_samples=301,
+        ),
+        InterpolationPlotSpec(
+            title="Cm-α（Mach 別）",
+            x_column="alpha",
+            y_column="Cm",
+            series_columns=["Mach"],
+            series_values=[0.2, 0.4],
+            x_range=(-5.0, 15.0),
+            x_samples=301,
+        ),
+    ]
+    export_interpolation_report_html(
+        aero_model.interpolator,
+        aero_raw,
+        plot_specs=aero_specs,
+        output_html=reports_dir / "aerodynamics_report.html",
+        report_title="Aerodynamics interpolation report",
+    )
+
+    propulsion_model = PropulsionModel(excel_path=wb.fullname, workbook=wb)
+    propulsion_raw = wb.sheets["11_推進DB"].range("A1").options(
+        pd.DataFrame, index=False, expand="table"
+    ).value
+    propulsion_specs = [
+        InterpolationPlotSpec(
+            title="Thrust-V（Altitude 別）",
+            x_column="V",
+            y_column="Thrust",
+            series_columns=["Altitude"],
+            series_values=[0.0, 3000.0, 6000.0],
+            x_range=(0.0, 120.0),
+            x_samples=301,
+        ),
+    ]
+    export_interpolation_report_html(
+        propulsion_model.interpolator,
+        propulsion_raw,
+        plot_specs=propulsion_specs,
+        output_html=reports_dir / "propulsion_report.html",
+        report_title="Propulsion interpolation report",
+    )
