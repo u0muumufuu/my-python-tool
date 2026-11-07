@@ -1,5 +1,7 @@
-numpy>=1.26
-pandas>=2.0
-scipy>=1.11
-openpyxl>=3.1
-xlwings>=0.30
+numpy
+pandas
+scipy
+openpyxl
+xlwings
+plotly>=5.0
+contourpy>=1.2

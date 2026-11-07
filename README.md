@@ -1,611 +1,754 @@
-# my-python-tool
+# Excel + Python 航空機性能推算：構成例
 
-Excel のシートに空力・エンジン特性などの数値テーブルを保存し、Python / SciPy で補間・非線形方程式の求根を行い、結果を Excel のセル・グラフに返すためのコードです。
+**目的**：Excel (`.xlsm`) を入力・特性DB・結果表・グラフに使い、Pythonを補間・求根・性能計算のエンジンにする。
 
-- `src/utils/interpolation.py`：Excel 表から補間関数を生成する `ExcelInterpolator`。
-- `src/utils/solvers.py`：単一・連立の非線形方程式を求解する `EquationSolver`。
-- `src/utils/excel_io.py`：計算結果をExcelへ出力し、`np.nan`/`np.inf` を `=NA()` に変換する `write_excel_result`。
-- `src/main.py`：Excel のボタンから呼び出す実装例。2つの補間関数の交点 `f(x) - g(x) = 0` も扱います。
+これは「T–V / Ps 計算」までを実装した**動作例**です。離陸・上昇・巡航・降下・着陸の解析は今後追加する前提です。
 
-**v5 の追加変更**：`ExcelInterpolator` が Excel の `=NA()` / `#N/A` / 空欄 / `np.nan` を出力列ごとに除外して補間モデルを構築します。ある行の `Cm` だけ欠損していても、同じ行の `CL`・`CD` のデータは保持します。詳しくは **2.6 欠損値の扱い**を参照してください。
+## 1. システム構成図（ExcelとPythonを各1つの枠で表現）
 
-**v4 の変更点**：`write_excel_result()` を新設し、求根だけでなく補間・性能計算など、すべての出力に対して非有限値を Excel の `#N/A` として書き込めます。`src/main.py` でもこの関数を使用します。`EquationSolver.solve()` は**未収束時に例外を投げる代わりに、既定で `result.x = np.nan` を返します**。連立の場合は要素がすべて `np.nan` の配列になります。`result.converged` で成否を必ず確認してください。例外が必要なら `raise_on_failure=True` を指定します。
-
-## 1. ファイル構成とインストール
-
-```text
-AircraftAnalysis/
-├── AircraftAnalysis.xlsm          # ご自身で用意するExcelブック（配布物には含まれません）
-├── src/
-│   ├── main.py                    # Excel連携の例
-│   └── utils/
-│       ├── __init__.py
-│       ├── interpolation.py       # ExcelInterpolator / ExcelRBFInterpolator
-│       ├── excel_io.py            # write_excel_result (NaN→Excel #N/A)
-│       └── solvers.py             # EquationSolver / EquationResult / ConvergenceError
-├── tests/
-│   ├── test_interpolation.py
-│   ├── test_solvers.py
-│   └── test_excel_io.py
-├── requirements.txt
-└── TEST_RESULTS.md
+```mermaid
+flowchart LR
+  E["Excel：AircraftPerformance.xlsm<br/>・00_計算管理（実行ボタン）<br/>・01_機体諸元 / 03_飛行条件<br/>・10_空力DB / 11_推進DB<br/>・30_TV / 31_Ps（結果表・グラフ）"]
+  P["Python：src/<br/>・main.py（実行管理）<br/>・models/aerodynamics.py・propulsion.py<br/>・analysis/performance_maps.py<br/>・utils/interpolation.py・solvers.py・excel_io.py"]
+  E -->|"RunPython / 入力条件・特性データ"| P
+  P -->|"計算結果 / 状態・残差 / 保存"| E
 ```
 
-Python の利用環境に必要なライブラリを入れます。
+## 2. フォルダ構造
+
+```text
+AircraftPerformance/
+├── AircraftPerformance.xlsm      # 利用者が用意（このZIPには含めない）
+├── src/
+│   ├── main.py                  # RunPythonからの入口
+│   ├── legacy_examples.py       # 過去のmain.run() 等の互換用
+│   ├── models/
+│   │   ├── aerodynamics.py      # 空力DBから係数補間モデルを1回構築
+│   │   └── propulsion.py        # 推進DBから推力補間モデルを1回構築
+│   ├── analysis/
+│   │   └── performance_maps.py  # T–V、Ps の簡易計算
+│   └── utils/
+│       ├── interpolation.py     # 既存のExcelInterpolator（v5そのまま）
+│       ├── solvers.py           # 既存のEquationSolver
+│       └── excel_io.py          # 既存のwrite_excel_result、NaN → =NA()
+├── tests/
+├── requirements.txt                 # 方式A用
+├── requirements_without_xlwings.txt # 方式B専用
+└── README.md
+```
+
+`models/aerodynamics.py` と `models/propulsion.py` は `ExcelInterpolator` をラップします。**ほかのファイルは補間クラスを直接何度も生成せず、既に作成済みの `aero` / `propulsion` オブジェクトを受け取って呼び出します。**
+
+```python
+# src/main.py の要点
+
+aero = AerodynamicsModel(excel_path=wb.fullname, workbook=wb)
+propulsion = PropulsionModel(excel_path=wb.fullname, workbook=wb)
+
+df = calculate_tv_ps(
+    aero, propulsion,
+    mass_kg=40.0,
+    wing_area_m2=2.0,
+    rho_kg_m3=1.225,
+    speed_of_sound_m_s=340.0,
+    altitude_m=0.0,
+    velocities_m_s=[20, 25, 30, 35, 40],
+)
+```
+
+空力・推進モデルの **補間器はこの実行内でそれぞれ1回構築**します。`calculate_tv_ps` の速度ループではPythonメモリ上の補間モデルを評価します。
+
+## 3. Excelシートとセル位置
+
+| シート名 | セル／列 | 値 | 備考 |
+|---|---|---|---|
+| `00_計算管理` | B2 | 状態 | 計算中・完了・エラー |
+| | B3 | 最終正常計算日時 | Pythonが書き込み |
+| | B4 | 実行メッセージ | Pythonが書き込み |
+| `01_機体諸元` | B2 | 質量 [kg] | 入力またはExcel数式 |
+| | B3 | 主翼面積 [m²] | 入力またはExcel数式 |
+| `03_飛行条件` | B2 | 空気密度 [kg/m³] | 入力またはExcel数式 |
+| | B3 | 音速 [m/s] | 入力またはExcel数式 |
+| | B4 | 飛行高度 [m] | 入力 |
+| | B5 | 最小速度 [m/s] | 入力 |
+| | B6 | 最大速度 [m/s] | 入力 |
+| | B7 | 速度点数（2～10000） | 入力 |
+| `10_空力DB` | A1～ | `alpha`, `Mach`, `CL`, `CD`, `Cm` | ヘッダー1行目。**α×Machの全格子点** |
+| `11_推進DB` | A1～ | `V`, `Altitude`, `Thrust` | ヘッダー1行目。**V×Altitudeの全格子点** |
+| `30_TV` | A5～ | `V`, `T_required`, `T_available`, `alpha`, `status` | Python書き込み |
+| `31_Ps` | A5～ | `V`, `Ps`, `alpha`, `status` | Python書き込み |
+
+列名の大文字・小文字はコードと一致させてください。出力領域は `A5:E10005` 等を初期化するため、この範囲に入力値・Excel数式・グラフを配置しないでください。グラフは列の右側に配置する想定です。
+
+`10_空力DB` または `11_推進DB` が不規則な散在点データであれば、`models/` 側の `method="regular_grid"` をデータに合わせて `"rbf"` 等に変更します。**RBFなら無制限に外挿してよいという意味ではありません。**
+
+## 4. Excel側の実行ボタン
+
+`AircraftPerformance.xlsm` の標準モジュールに以下を登録し、フォームコントロールのボタンに割り当てます。
+
+```vb
+Sub RunMaps()
+    RunPython "import main; main.run_maps()"
+End Sub
+```
+
+xlwingsアドイン（またはStandalone VBAモジュール）の設定で、**PYTHONPATHにこのプロジェクトの `src` フォルダ**を設定してください。
+
+例：`C:\AircraftPerformance\src`
+
+`xw.Book.caller()` がボタンを押したブックを参照するため、Excelパスを `main.py` に固定する必要はありません。Python環境の配置と実行権限、xlwingsアドインまたはStandaloneモジュール、マクロ許可は別途必要です。
+
+## 5. Excelグラフの作成方法
+
+Excelの **XY散布図** を使います。補間や性能計算をPython側で行った結果セルを参照するため、PNG画像ではありません。
+
+- `30_TV`：横軸X=`A6:A(5+N)`、必要推力Y=`B6:B(5+N)`、利用可能推力Y=`C6:C(5+N)`
+- `31_Ps`：横軸X=`A6:A(5+N)`、比剰余出力Y=`B6:B(5+N)`
+
+N（速度点数）が頻繁に変わる場合は、Excelテーブル・動的名前付き範囲・VBA等で参照範囲を更新してください。**単に固定範囲でグラフを作ると増えた行が表示されない**ことがあります。
+
+`#N/A` になる数値は `write_excel_result` が `=NA()` で出力します。例えば迎角の解がない速度ではグラフに欠損点が現れます。Excelのグラフ種類・バージョンにより欠損点の結線設定は確認してください。
+
+## 6. モデルから解析へ渡す設計
+
+`src/models/aerodynamics.py` の目的は「空力特性データを読む」「必要な条件でCL, CD, Cmを返す」ことです。
+
+```python
+# 一回だけ生成
+aero = AerodynamicsModel(excel_path=wb.fullname, workbook=wb)
+
+# 計算ファイルから呼ぶ場合、aeroインスタンスを渡す
+coefficients = aero.coefficients(alpha=5.0, mach=0.2)
+CL = coefficients["CL"]
+CD = coefficients["CD"]
+```
+
+今後 `analysis/trim.py`、`analysis/climb.py`、`analysis/cruise.py` を追加するときは、`aero` を引数に渡してください。これらのファイルが `ExcelInterpolator` を各自構築する設計は避けます。
+
+なお、データ更新後の次の実行では新しいモデルを生成するため、通常のExcelボタン運用で `reload()` を明示する必要はありません。
+
+## 7. 本例の計算上の制限（重要）
+
+**これはシステム連携を示すサンプルであり、実機の飛行性能推算の完成形ではありません。**
+
+- 定常水平飛行・単純化した力の釣合い：`CL_required = W/(q S)`、`q = ρ V²/2`
+- 求根：`CL(α,Mach) - CL_required = 0` の1変数方程式を `EquationSolver` の `brentq` で求める。
+- `T_required ≈ D = q S CD` とし、`Ps = (T_available-D) V/W` とする。
+- 迎角のみを求めており、**Cm=0と舵角を求める完全な縦トリム計算ではありません**。
+- 推力データは固定出力状態での `Thrust(V,Altitude)` を仮定。プロペラ機では回転数、パワー、プロペラ効率等を加味するモデルに拡張が必要。
+- マップ外や釣合い解なしは出力をNaNにし、Excelでは `#N/A` となる。入力データの構造不備などは例外で停止する。
+- 複数の入力・出力で入力単位系・係数符号・基準翼面積・モーメント基準点を揃える必要がある。
+- 大量のExcelのセル通信は遅いため、データベースの読み込みと結果の書き込みはなるべく一括で行う。
+
+## 8. インストール・テスト
 
 ```bash
 python -m pip install -r requirements.txt
-```
-
-Excel のボタンから呼び出すには、xlwings のアドインまたは Standalone 方式のVBA連携が必要です。`PYTHONPATH` に `src` フォルダを指定し、Excel ブックはVBAマクロを保存できる `.xlsm` にしてください。
-
-```vb
-Sub RunCalculation()
-    RunPython "import main; main.run()"
-End Sub
-```
-
-> 補間・求根の自動テストは Excel アプリを起動せずに行えます。配布物に Excel ブックは含まれません。
-
----
-
-# 2. `interpolation.py`：ExcelInterpolator の使い方
-
-## 2.1 Excel 表の準備
-
-例：「空力DB」シートの `D5` に見出し行を置き、その下に数値を配置します。
-
-| alpha | Mach | CL | CD | Cm |
-|---:|---:|---:|---:|---:|
-| 0 | 0.1 | 0.20 | 0.030 | 0.06 |
-| 5 | 0.1 | 0.70 | 0.045 | 0.01 |
-| 10 | 0.1 | 1.10 | 0.080 | -0.04 |
-| 0 | 0.2 | 0.22 | 0.032 | 0.06 |
-| 5 | 0.2 | 0.72 | 0.048 | 0.01 |
-| 10 | 0.2 | 1.12 | 0.085 | -0.04 |
-
-この例は `alpha` × `Mach` の **3 × 2 = 6個の全組合せ**が存在するため、`regular_grid` で読み込めます。格子点は等間隔でなくてもよく、Excel内で行が並び替わっていてもかまいません。
-
-前提・注意点：
-
-- ヘッダーは開始セルから右に連続し、データはヘッダーの次の行から下に連続すること。表の途中に完全空白行を入れないこと。
-- 列名は重複不可。`input_columns` / `output_columns` は Excel のヘッダー名と**完全一致**させること。
-- 出力列は数値のほか `=NA()`、`#N/A`、空欄、`np.nan` を許可します。**欠損は出力列ごとに除外**され、他の出力の有効データは残ります。入力列に欠損がある行は全出力で除外します。任意の文字列や無限大はエラーです。
-- 入力座標の組合せが重複しているとエラーになります。変化しない入力列も指定できません。
-- 保存済みファイルを読み込む場合は `.xlsx` / `.xlsm` に対応します。`.xls` は未対応です。
-
-## 2.2 基本的な利用例
-
-```python
-from utils.interpolation import ExcelInterpolator
-
-aero = ExcelInterpolator(
-    excel_path="AircraftAnalysis.xlsm",  # Excelファイルの保存場所
-    sheet_name="空力DB",
-    start_cell="D5",                     # デフォルト: "A1"
-    input_columns=["alpha", "Mach"],
-    output_columns=["CL", "CD", "Cm"],
-    method="regular_grid",
-)
-
-result = aero.predict(alpha=5.0, Mach=0.2)
-print(result)         # {'CL': 0.72, 'CD': 0.048, 'Cm': 0.01} に相当
-print(result["CL"])   # float
-```
-
-`excel_path` は文字列または `pathlib.Path` で指定できます。**補間器の構築時に表を一度だけ読み込みます**。その後の `predict()` で Excel にアクセスしません。
-
-### 開いているExcel（未保存の変更を含む）を利用
-
-Excel の `RunPython` から呼び出す場合は、**`workbook=wb` を指定**するのがおすすめです。
-
-```python
-import xlwings as xw
-from utils.interpolation import ExcelInterpolator
-
-wb = xw.Book.caller()  # Excelのボタンから呼び出されたブック
-
-aero = ExcelInterpolator(
-    excel_path=wb.fullname,
-    sheet_name="空力DB",
-    input_columns=["alpha", "Mach"],
-    output_columns=["CL", "CD", "Cm"],
-    method="regular_grid",
-    start_cell="D5",
-    workbook=wb,   # Excel上の、未保存のセル変更も反映できる
-)
-```
-
-`workbook` 省略時は、ディスクに**保存済み**のファイルから `openpyxl` で読み込みます。Excel数式のセルは、保存時に保持されているキャッシュ値を読みます（Python側でExcel数式を計算しません）。`workbook=wb` の場合は起動中のExcelから値を取得するため、必要なら読み込み前に `wb.app.calculate()` を実行してください。
-
-## 2.3 主なコンストラクタ引数
-
-| 引数 | 型・既定値 | 用途 |
-|---|---|---|
-| `excel_path` | `str \| Path` 必須 | Excelファイルパス。`workbook` 指定時も管理情報として渡す |
-| `sheet_name` | `str` 必須 | 表のあるシート名 |
-| `input_columns` | 文字列のリスト／タプル | 独立変数の列名（複数可）。順序は内部の次元順 |
-| `output_columns` | 文字列または文字列のリスト／タプル | 出力する列名（複数可） |
-| `method` | `"rbf"` | 補間方式。下表参照 |
-| `start_cell` | `"A1"` | 見出し行の左上セル。例：`"D5"` |
-| `workbook` | `None` | xlwings の `Book`。未保存セル変更も読み込みたいときに指定 |
-| `check_bounds` | `True` | 各入力の最小・最大値を越えた評価を拒否する |
-| `smoothing` | `0.0` | RBFの平滑化パラメータ |
-| `neighbors` | `None` | RBFの評価時に使う近傍点数。`None` は全点 |
-| `rbf_kernel` | `"thin_plate_spline"` | RBFのカーネル |
-| `rbf_epsilon` | `None` | カーネルによって必要になる形状パラメータ |
-| `grid_method` | `"linear"` | 規則格子補間の内部方式 |
-
-`method` の文字列は小文字で扱われます。`smoothing` / `neighbors` はRBF専用です。
-
-## 2.4 選べる補間方式
-
-| `method` | SciPy | 想定するデータ | 注意点 |
-|---|---|---|---|
-| `"regular_grid"` | `RegularGridInterpolator` | 直交格子（全組合せがある） | **入力座標の格子点そのものが不足する場合**はエラー。ある出力値だけ `#N/A` の場合は、その出力のみ散在点補間に切替 |
-| `"rbf"` | `RBFInterpolator` | 不規則に分布する散在点 | 距離を使うため内部で min–max 正規化。多数点では計算負荷に注意 |
-| `"linear_nd"` | `LinearNDInterpolator` | 2次元以上の散在点 | 凸包外は評価不可（NaNとなり、クラスからValueError） |
-| `"nearest_nd"` | `NearestNDInterpolator` | 散在点の最近傍 | 値は段階的に変化する。入力の正規化あり |
-| `"pchip"` | `PchipInterpolator` | 1次元の曲線 | 局所的な単調性・形状の保持を意図する |
-
-**空力・エンジン特性の選び方**：
-
-- 全格子点が存在する空力6分力テーブルやエンジン性能マップ → `regular_grid` を第一候補にする。
-- CFD、風洞試験などで不規則に配置された複数変数の点 → `rbf` または `linear_nd`。
-- 1次元の特性曲線 → `pchip`。
-- 不連続な最近傍選択でも問題ないデータ → `nearest_nd`。
-
-### `regular_grid` の補間次数を選ぶ
-
-```python
-interpolator = ExcelInterpolator(
-    excel_path="AircraftAnalysis.xlsm",
-    sheet_name="空力DB",
-    input_columns=["alpha", "Mach"],
-    output_columns=["CL", "CD"],
-    method="regular_grid",
-    grid_method="linear",  # nearest / slinear / cubic / quintic / pchip も指定可能
-)
-```
-
-高次補間では、各軸に必要な点数などの条件があります。格子データの密度が十分でない場合は `linear` を使ってください。
-
-### `rbf` の自動正規化
-
-`rbf`（および `linear_nd` / `nearest_nd`）では、各独立変数について
-
-\[
- x_{i,\mathrm{norm}} = \frac{x_i-x_{i,\min}}{x_{i,\max}-x_{i,\min}}
-\]
-
-を**クラス内部で**実施します。補間器の作成時と評価時の両方で同じ変換を使うため、呼び出し側で正規化する必要はありません。なお、各変数の物理的な重要度が異なる場合は、0–1正規化だけで適切な距離になるとは限りません。
-
-```python
-engine = ExcelInterpolator(
-    excel_path="AircraftAnalysis.xlsm",
-    sheet_name="エンジンDB",
-    input_columns=["RPM", "Altitude"],
-    output_columns=["Power", "FuelFlow"],
-    method="rbf",
-    smoothing=0.0,
-    neighbors=None,
-)
-
-result = engine.predict(RPM=3000, Altitude=1000)
-print(result["Power"], result["FuelFlow"])
-```
-
-RBFは全点を使用する場合、点数増加に伴う計算・メモリ負荷が大きくなります。点数が多い場合には `neighbors` の指定や `regular_grid` の採用を検討してください。
-
-## 2.5 複数条件を一括評価する／`reload()`
-
-```python
-import numpy as np
-
-alpha = np.array([0.0, 5.0, 10.0])
-result = aero.predict(alpha=alpha, Mach=0.2)
-print(result["CL"])  # shape=(3,) の NumPy 配列
-
-# Excelシートの値を編集した後に補間モデルを作り直す
-# workbook=wb を使っていれば未保存の変更も対象
-# workbook を省略していればExcel側で保存してから reload()
-aero.reload()
-```
-
-スカラー値と配列値は NumPy のブロードキャスト規則に従って組み合わせられます。`predict()` は**常に列名をキーとする辞書**を返します（スカラー入力なら値は `float`、配列入力なら `ndarray`）。`aero(...)` と直接呼び出す方法も `predict()` と同等です。
-
-範囲外について：`check_bounds=True` は**各入力変数の最小～最大の箱型範囲**だけを検査します。散在点で定義される多次元の凸包外を完全に判定する機能ではありません。`linear_nd` は全データが揃っている場合、凸包外がNaNになればValueErrorを発生させます。**欠損値を除外した列**では、残った点の凸包外で `np.nan` を返すことがあります。`check_bounds=False` では補間方式に応じて外挿が行われますが、物理的妥当性は保証しません。
-
-エラー例：列名違い、入力座標の重複、NA() 以外の不正な文字列、入力格子の欠落、評価点の範囲外、データが低次元部分空間に偏ることによるSciPyの失敗など。**一部出力の有効点が足りない場合、その出力だけ `np.nan` を返します**。
-
-## 2.6 `=NA()` / `#N/A` / `np.nan` を含むシートの扱い（v5）
-
-例えば「空力DB」に次の表があるとします。
-
-| AOA | CL | CD | Cm |
-|---:|---:|---:|---:|
-| 0 | 0.0 | 0.010 | 0.05 |
-| 1 | 0.1 | 0.011 | `=NA()` |
-| 2 | 0.2 | 0.014 | 0.03 |
-| 3 | 0.3 | 0.019 | 0.02 |
-
-`Cm` のセルは Excel 上では **`#N/A`** と表示されます。v5 の `ExcelInterpolator` はこの行をまるごと捨てず、**CL と CD の4点はそのまま使用し、Cm は3点だけで補間します。**
-
-```python
-from utils.interpolation import ExcelInterpolator
-from utils.excel_io import write_excel_result
-
-# Excel から RunPython で呼び出したブックが wb として取得済みと仮定
-interp = ExcelInterpolator(
-    excel_path=wb.fullname,
-    sheet_name="空力DB",
-    input_columns=["AOA"],
-    output_columns=["CL", "CD", "Cm"],
-    method="pchip",
-    workbook=wb,
-)
-
-print(interp.n_points_by_output)
-# {'CL': 4, 'CD': 4, 'Cm': 3}
-
-result = interp.predict(AOA=1.0)
-# result['CL'] = 0.1
-# result['CD'] = 0.011
-# result['Cm'] は残った3点から補間した値（この例では 0.04）
-
-ws = wb.sheets["計算結果"]
-write_excel_result(ws, "B2", [result["CL"], result["CD"], result["Cm"]])
-```
-
-**欠損値の判定と扱い**
-
-- 対応：Excel の `=NA()`、計算済みエラー値 `#N/A`、空欄、Python の `np.nan`、および文字列 `"NA()"`。出力列で見つけたときはその出力の学習点だけを除きます。
-- `AOA`、`Mach` など **入力列** に欠損がある場合は、座標を定義できないためその行を全出力から除きます。
-- `"abc"` や `#VALUE!` など、認めていない文字列・エラーは勝手に欠損扱いにせず `ValueError` にします。
-- 出力列で残った点数が不足する、または全点が `#N/A` の場合でも**他の出力のモデルは使用可能**です。その列の `predict()` は `np.nan` を返します。Excelへ `write_excel_result()` で保存すると `=NA()`、表示は `#N/A` となります。
-- `interp.n_points_by_output` で各出力に使った有効点数、`interp.output_status` で `"complete"`（欠損なし）／`"partial"`（一部欠損）／`"unavailable"`（補間不可）を確認できます。`interp.n_dropped_input_rows` は入力座標欠損で除外した行数です。
-
-**補間方式による注意**
-
-- `"rbf"`、`"pchip"`、`"linear_nd"`、`"nearest_nd"`：各出力列の有効点だけを使用します。RBFなどの入力正規化は従来どおりクラス内部で実行します。
-- `"regular_grid"`：すべての入力座標組合せがシート上に存在する必要があります。**欠損のない出力**は `RegularGridInterpolator` を継続使用します。一方、**欠損のある出力**は、2次元以上なら `grid_method="nearest"` 時に最近傍補間、それ以外は `LinearNDInterpolator` に切り替えます。1次元では有効点を使って線形または最近傍補間します。つまり、`grid_method="cubic"` 等を指定していても、欠損列だけは区分線形補間になります。
-- 欠損がある出力では、有効点の凸包外・範囲外に値を決められない場合、`np.nan` を返すことがあります。**欠損座標に必ず数値を補完できるわけではありません。** 物理的に不適切な外挿を避けるためです。
-- 補間に使った点が足りず `np.nan` になった場合、その原因は `output_status` と `n_points_by_output` で確認してください。NaNが多い列の結果をトリム計算へ渡す場合は、特に事前チェックを推奨します。
-
-保存済み `.xlsx` / `.xlsm` で `=NA()` があると、`openpyxl` の `data_only=True` は保存時の計算キャッシュを読みます。キャッシュがない数式セルは `None` として扱われ、欠損になります。Excelを開いた状態なら `workbook=wb` を渡してExcelの現在値を使用できます。
-
----
-
-# 3. `solvers.py`：EquationSolver の使い方
-
-`EquationSolver` は**数値関数を `func=...` として渡す**設計です。対象関数はExcelから作った `ExcelInterpolator` でも、通常のPython関数でも構いません。
-
-## 3.1 方程式数・区間に応じた解法の選択
-
-| 入力条件 | 解法 | 必須指定 | 戻り値の `result.x` |
-|---|---|---|---|
-| 単一方程式・区間あり | `scipy.optimize.brentq` | `bracket=(lower, upper)` | `float` |
-| 単一方程式・区間なし | `scipy.optimize.root` | `x0=初期値` | `float` |
-| 連立方程式（同数の未知数と式） | `scipy.optimize.root` | `x0=[初期値1, ...]` | `ndarray` |
-
-`bracket` と `x0` は**同時に指定できません**。`brentq` では、通常、区間内で関数が連続し、両端の関数値が異符号（または一方が0）である必要があります。符号条件を満たさない場合、このクラスでは**未収束結果 `x=NaN` を返す**のが既定です。下限が上限以上など、入力そのものの誤りは `ValueError` です。
-
-## 3.2 単一方程式・区間あり（brentq）
-
-\(f(x)=x^2-4=0\) の正の解を求める例：
-
-```python
-from utils.solvers import EquationSolver
-
-solver = EquationSolver()
-result = solver.solve(lambda x: x**2 - 4, bracket=(0.0, 3.0))
-
-print(result.x)          # 約 2.0
-print(result.converged)  # True
-print(result.method)     # "brentq"
-print(result.residual)   # 0 に近い値
-```
-
-## 3.3 単一方程式・区間なし（root）
-
-初期値から探索し、探索範囲は限定しません。
-
-```python
-result = solver.solve(lambda x: x**2 - 4, x0=1.5)
-print(result.x)       # 約 2.0
-print(result.method)  # "root/hybr"
-```
-
-初期値によって別の根に収束する、根が見つからない、途中で補間器の範囲外を評価するなどの可能性があります。
-
-## 3.4 連立非線形方程式（root）
-
-\[
-\begin{cases}
-x+y-3 = 0 \\
-x-y-1 = 0
-\end{cases}
-\]
-
-```python
-import numpy as np
-from utils.solvers import EquationSolver
-
-def equations(values):
-    x, y = values
-    return [x + y - 3, x - y - 1]
-
-result = EquationSolver().solve(equations, x0=[0.0, 0.0])
-
-if result.converged:
-    print(result.x)  # np.ndarray: [2., 1.]
-else:
-    print(result.x)  # np.ndarray: [nan, nan]
-```
-
-連立の場合、`func` が**未知数の個数と同じ長さの1次元の残差ベクトル**を返す必要があります。
-
-## 3.5 追加引数を渡す
-
-```python
-def force_balance(x, k, force):
-    return k*x - force
-
-result = solver.solve(force_balance, bracket=(0, 10), args=(2.0, 6.0))
-print(result.x)  # 3.0
-```
-
-`args` はタプルで指定してください。
-
-## 3.6 未収束時の扱い：NaN と Excel の `#N/A`
-
-**未収束時に `result.x` へ最後の推定値を入れると、誤って有効な解として利用される危険があります。** この版では既定で次のように返します。
-
-```python
-import numpy as np
-from utils.solvers import EquationSolver
-
-solver = EquationSolver(root_method="lm")
-result = solver.solve(lambda x: x**2 + 1.0, x0=1.0)
-
-print(result.converged)  # False
-print(np.isnan(result.x))  # True
-print(result.residual_norm)  # 最終評価点での最大絶対残差（診断用）
-print(result.last_x)  # 最終推定値（診断用。有効な解ではない）
-print(result.message)  # 未収束の理由
-```
-
-- **単一方程式**：`result.x` は Python の `float('nan')`（`np.isnan()` で判定可能）。
-- **連立方程式**：`result.x` は未知数の数と同じ長さの、すべてが `np.nan` の配列。
-- `result.residual`：最終評価点での残差を**診断用として保持**。区間の両端が同符号の場合は `NaN`。
-- `result.last_x`：アルゴリズムが最後に推定した値（存在する場合）。収束解として使用しないこと。
-- `result.converged=False` の場合、解が存在しないと証明できたとは限りません。**解を見つけられなかった**ことを意味します。
-
-**重要：Python の `np.nan` と Excel の `=NA()` は別物です。** `np.nan` をそのまま Excel セルに代入しても、必ず `#N/A` と表示されるわけではありません。Excel 上で `#N/A` を表示したい場合は `=NA()` を**数式として**設定してください。
-
-```python
-# wb は xw.Book.caller() で得たブック
-result = EquationSolver().solve(lambda x: x**2 + 1, x0=1.0)
-ws = wb.sheets["計算結果"]
-
-if result.converged:
-    ws.range("B2").value = result.x
-else:
-    ws.range("B2").formula = "=NA()"  # Excelの #N/A
-
-ws.range("B3").value = "OK" if result.converged else result.message
-```
-
-複数未知数なら、それぞれの出力セルについて `=NA()` を入れてください。`result.x` をExcelに書くだけでは、PythonとExcelのNaN表現が一致しない場合があります。
-
-### 未収束を例外にしたい場合
-
-```python
-from utils.solvers import ConvergenceError
-
-try:
-    solver.solve(lambda x: x**2 + 1, x0=1.0, raise_on_failure=True)
-except ConvergenceError as exc:
-    print(exc.result.converged)  # False
-    print(exc.result.x)          # nan
-    print(exc.result.last_x)     # 最終推定値があれば表示
-```
-
-ただし、**誤った型・初期値不足・不正な区間指定・方程式からNaNが返る・補間器が範囲外を拒否した**などの入力・評価エラーは、`raise_on_failure=False` でも通常の例外になります。これは「収束できなかった」と「入力が不正」を区別するためです。
-
-## 3.7 引数一覧
-
-### `EquationSolver(...)`
-
-| 引数 | 既定 | 意味 |
-|---|---|---|
-| `root_method` | `"hybr"` | `scipy.optimize.root` で使う方式 |
-| `tol` | `1e-10` | SciPyに渡す解探索の収束許容値（brentqの `xtol`、rootの `tol`） |
-| `residual_tol` | `1e-8` | 残差の最大絶対値がこの値以下であることを追加で要求 |
-| `maxiter` | `100` | `brentq` の最大反復回数 |
-| `root_options` | `None` | `root` に渡す方式依存のオプション（辞書） |
-
-`root_options` の例（`hybr` の最大評価回数を指定）：
-
-```python
-solver = EquationSolver(
-    root_method="hybr",
-    tol=1e-10,
-    residual_tol=1e-7,
-    root_options={"maxfev": 300},
-)
-```
-
-**注意**：`maxiter` は `brentq` 側の制限であり、`root` の反復・評価回数を指定するには `root_options` を使います。また、`tol` は残差の許容値と同じではありません。残差の合格基準には `residual_tol` を使ってください。
-
-### `solver.solve(func, ...)`
-
-| 引数 | 既定 | 意味 |
-|---|---|---|
-| `func` | 必須 | 残差関数。1変数ではスカラーを、連立では残差ベクトルを返す |
-| `x0` | `None` | `root` の初期値。単一なら数値、連立なら長さnのリストなど |
-| `bracket` | `None` | `brentq` の上下限 `(lower, upper)` |
-| `args` | `()` | 関数に追加で渡す引数のタプル |
-| `raise_on_failure` | `False` | `True` なら未収束時に `ConvergenceError` |
-
-### `EquationResult` の属性
-
-| 属性 | 内容 |
-|---|---|
-| `x` | 採用した解。未収束時は `nan` または `nan` 配列 |
-| `converged` | SciPy成功判定と残差許容値の両方が成立したか |
-| `residual` | 評価した残差（収束しなかった場合も診断情報を可能な限り保持） |
-| `residual_norm` | 残差の最大絶対値（性質上 NaN となる場合もある） |
-| `last_x` | 未収束時の最後の推定値。なければ `None` |
-| `method` | 使用した解法（例：`"brentq"` / `"root/hybr"`） |
-| `message` | 終了理由・失敗理由 |
-| `function_calls` | 関数評価回数の参考値 |
-| `iterations` | 反復回数（取得可能な場合） |
-
-飛行性能やトリム計算の連立式では、揚力[N]・モーメント[N·m]など、式ごとの残差の単位と桁が異なることがあります。適切な基準値で**残差を無次元化**してから `root` に渡すと、判定が明確になります。
-
----
-
-# 4. 補間関数2つの交点を求める例（Excelと連携）
-
-`src/main.py` の `run_intersection_example()` は、Excelから読み取った2つの補間関数を生成し、\(f(x)-g(x)=0\) を解きます。
-
-Excelシート **「交点DB」** の `A1` から次の表を配置します。
-
-| x | f | g |
-|---:|---:|---:|
-| 0 | 1 | 4 |
-| 1 | 3 | 4.5 |
-| 2 | 5 | 5 |
-| 3 | 7 | 5.5 |
-| 4 | 9 | 6 |
-
-この表は `f(x)=2x+1`、`g(x)=0.5x+4` に相当するため、交点は `x=2` です。
-
-```python
-from utils.interpolation import ExcelInterpolator
-from utils.solvers import EquationSolver
-
-# ここでは wb = xw.Book.caller() により呼び出し元ブックを取得済みとする
-f_interp = ExcelInterpolator(
-    wb.fullname, "交点DB", ["x"], "f",
-    method="pchip", workbook=wb,
-)
-g_interp = ExcelInterpolator(
-    wb.fullname, "交点DB", ["x"], "g",
-    method="pchip", workbook=wb,
-)
-
-def difference(x):
-    return f_interp.predict(x=x)["f"] - g_interp.predict(x=x)["g"]
-
-result = EquationSolver().solve(difference, bracket=(0.0, 4.0))
-
-ws = wb.sheets["交点結果"]
-if result.converged:
-    ws.range("B2").value = result.x
-else:
-    ws.range("B2").formula = "=NA()"
-import math
-if math.isfinite(result.residual):
-    ws.range("B3").value = result.residual
-else:
-    ws.range("B3").formula = "=NA()"
-ws.range("B4").value = result.method
-ws.range("B5").value = "OK" if result.converged else result.message
-wb.save()
-```
-
-Excel の「交点結果」シートを用意し、VBAボタンに以下のマクロを割り当てます。
-
-```vb
-Sub RunIntersectionExample()
-    RunPython "import main; main.run_intersection_example()"
-End Sub
-```
-
-`src/main.py` の `run()` は、別例として空力DBの `regular_grid` 補間とエンジンDBの `rbf` 補間を扱います。具体的なシート名・セル位置は `main.py` 冒頭のコメントを参照してください。
-
----
-
-# 5. テストと検証
-
-```bash
 python -m pip install pytest
 python -m pytest -q tests/
-python -m doctest src/utils/solvers.py
-python -m compileall -q src tests
 ```
 
-テストは実際の `.xlsx` / `.xlsm` ファイルを使った補間器検証と、Excelブックを模擬した読み書き確認を含みます。**Windows / macOS の Excel 実機上でのVBAボタン実行は、別途利用環境で確認してください。**
+テストは実際の `.xlsx` 形式の仮の入力テーブルを `openpyxl` で作成し、空力・推進モデル、求根、T–V/Ps計算、Excel書き込みの模擬処理を検証します。**Excel実機でのマクロボタン・アドイン操作は未検証**です。
 
-詳しい結果は `TEST_RESULTS.md` に記載します。
+### 互換性
+
+従来の v5 のサンプル `main.run()` / `main.run_intersection_example()` は `legacy_examples.py` 経由で呼び出せます。ただし、それらは旧シート名（`空力DB`、`エンジンDB` 等）を使うため、新しい `run_maps()` の構成とは区別してください。
 
 
 ---
 
-# 6. `excel_io.py`：計算結果をExcelに書き込む共通関数
+## 9. ExcelからPythonを起動する：アドイン不要の2方式（Windows版Excel）
 
-計算結果をExcelに書き込むときは、**補間結果か求根結果かを区別せず**、
-`write_excel_result()` を使用してください。これでPythonの `np.nan` をExcelの
-エラー値 `#N/A` として表示できます。具体的には、該当セルの `.formula`
-に `=NA()` を設定します（文字列の `"NA()"` を保存するわけではありません）。
-`+np.inf` / `-np.inf` も同様に `#N/A` に変換します。
+この節は、**Excelのボタンを押してPythonを動かし、T–V / Psの数値表をExcelに保存するまで**の再現手順です。
+`AircraftPerformance.xlsm` は利用者が作成します（この配布物には空の `.xlsm` を含めていません）。
+
+### 9.1 どちらを選ぶか
+
+| 項目 | **A. xlwings Standalone** | **B. VBAでPythonコマンドを直接起動** |
+|---|---|---|
+| Excelアドインのインストール | **不要** | **不要** |
+| Excel側のxlwingsコード | ブックに組み込むVBAモジュールが必要 | **不要** |
+| Python側で使うライブラリ | xlwings + NumPy / SciPy等 | **openpyxl** + NumPy / SciPy等（xlwings不要） |
+| Pythonの入口 | `src/main.py` の `run_maps()` | `src/run_without_xlwings.py` |
+| Excelデータの読み取り | `xw.Book.caller()` により**開いているブックを直接読む** | Excelが一度**保存**したブックをファイルとして読む |
+| Excelへの結果の戻し方 | Pythonから開いているセルへ直接書き込む | Pythonが別の一時`.xlsx`を出力、VBAが転記 |
+| 未保存の値 | 直接参照可能 | VBAで保存してから実行 |
+| 結果グラフ | Excelのセルを更新すると再描画 | 同左 |
+| 開発負荷 | **低い** | やや高い（戻し込み／例外処理が必要） |
+| 推奨 | **今回の第一候補** | アドイン・xlwings両方を使いたくない場合 |
+
+どちらも **ローカルのWindowsデスクトップ版Excel、VBAが実行可能な環境**を前提とします。
+Python実行環境は各PCに必要で、VBAと外部プログラム実行が会社のポリシーで禁止されていないことを確認してください。
+**Excel Online/ブラウザ版**では、このVBA実行方法は使用できません。
+
+#### 共通：プロジェクト配置
+
+```text
+C:\AircraftPerformance\
+├── AircraftPerformance.xlsm
+├── .venv\                     # Pythonの仮想環境（利用者が作成）
+│   └── Scripts\python.exe
+├── src\
+│   ├── main.py                 # 方式A
+│   ├── run_without_xlwings.py  # 方式B
+│   ├── models\ ...
+│   ├── analysis\ ...
+│   └── utils\ ...
+├── excel_vba\
+│   ├── RunMaps_xlwings.bas
+│   └── RunMaps_without_xlwings.bas
+├── requirements.txt                 # 方式A用
+├── requirements_without_xlwings.txt # 方式B専用
+└── README.md
+```
+
+**共通の初期セットアップ：** Windowsの**コマンドプロンプト（cmd.exe）**で実行します。例ではWindowsの`py`コマンドを使います。
+
+```bat
+cd /d C:\AircraftPerformance
+py -m venv .venv
+REM 方式Aの場合
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+REM 方式Bだけの場合（xlwingsを入れない）
+REM .venv\Scripts\python.exe -m pip install -r requirements_without_xlwings.txt
+.venv\Scripts\python.exe -m pip install pytest
+.venv\Scripts\python.exe -m pytest -q tests
+```
+
+`py` がない場合、PATHにある `python` コマンドを使用してください。既存の仮想環境があればそれを利用して構いません。
+`requirements.txt` は方式A用でxlwingsを含みます。**方式Bだけ**使う場合は、代わりに `requirements_without_xlwings.txt` をインストールしてください。
+
+### 9.2 方式A：xlwings Standalone（アドインなし・開いているExcelを直接操作）
+
+xlwings公式の `--standalone` は、Excelアドインの代わりになるVBAモジュールをブック内に持たせる方式です。Excel側のアドインインストールは不要ですが、**ブック内のxlwings VBAモジュールは必要**です。
+
+**手順 A-1. Standaloneの雛形を生成する**
+
+```bat
+cd /d C:\AircraftPerformance
+.venv\Scripts\xlwings.exe quickstart StandaloneSeed --standalone
+```
+
+`StandaloneSeed\StandaloneSeed.xlsm` などが生成されます。これは**既存の `AircraftPerformance.xlsm` を上書きするコマンドではありません**。既存ブックに組み込むための雛形です。
+
+**手順 A-2. 内蔵VBAモジュールを既存ブックに移す**
+
+1. `StandaloneSeed.xlsm` と `AircraftPerformance.xlsm` を **Windows版Excel** で開く。
+2. `Alt + F11` でVBAエディターを開く。
+3. 左のプロジェクトエクスプローラーで雛形ブックの標準モジュールを確認し、xlwings用のモジュールを右クリックして **[ファイルのエクスポート]** で `.bas` を書き出す。
+4. `AircraftPerformance.xlsm` のプロジェクトを選び **[ファイル] → [ファイルのインポート]** で、その `.bas` を組み込む（同名モジュールが既にある場合は重複させない）。
+5. 雛形に含まれる専用の補助モジュールやクラスがあれば、それも必要に応じて移す。Windows版では通常は独立したVBAモジュールで利用できる。
+6. `AircraftPerformance.xlsm` を保存する。**.xlsmのまま保存**すること。
+
+> 新規作成なら `StandaloneSeed.xlsm` を `AircraftPerformance.xlsm` にリネームし、シートを追加して使い始めるほうが簡単です。既存ブックを使用する場合のみモジュール移植が必要です。
+
+**手順 A-3. Pythonの場所とソースコードの場所を設定する**
+
+`AircraftPerformance.xlsm` に `xlwings.conf` という名前のワークシートを作り、次の2列で設定します。
+（雛形の `_xlwings.conf` シートを利用する場合は、先頭の `_` を削除して `xlwings.conf` に変更してください。）
+
+| A列（設定キー） | B列（値の例） |
+|---|---|
+| `INTERPRETER_WIN` | `C:\AircraftPerformance\.venv\Scripts\python.exe` |
+| `PYTHONPATH` | `C:\AircraftPerformance\src` |
+
+パスは**実際に配置したフォルダ**に変更します。仮想環境以外のPythonを使う場合は、その `python.exe` の実パスにします。ブックを別の場所に移動したら設定の変更が必要になることがあります。
+
+**手順 A-4. マクロを登録する**
+
+配布物の `excel_vba/RunMaps_xlwings.bas` を `Alt + F11 → ファイル → ファイルのインポート` から組み込むか、通常の標準モジュールに次のコードを貼り付けます。
+
+```vb
+Option Explicit
+
+Public Sub RunMapsWithXlwings()
+    On Error GoTo Failure
+    RunPython "import main; main.run_maps()"
+    MsgBox "計算が完了しました。", vbInformation
+    Exit Sub
+Failure:
+    MsgBox "実行に失敗しました: " & Err.Description, vbExclamation
+End Sub
+```
+
+ここで `RunPython` を提供するのは、**手順 A-2 でブック内に組み込んだxlwingsのVBAモジュール**です。Excelにアドインをインストールする必要はありません。
+
+Python側は既存の `src/main.py` がそのまま使えます。
 
 ```python
-import numpy as np
-from utils.excel_io import write_excel_result
+# src/main.py （既存のエントリーポイント）
+def run_maps():
+    import xlwings as xw
+    wb = xw.Book.caller()  # 呼び出し元ブック。パス指定不要
+    # 以降、空力DB・推進DBの読み込み → 計算 → Excelへ書き込み
+```
 
-# wb = xw.Book.caller()
-ws = wb.sheets["計算結果"]
+`main.py` の関数内で `xw.Book.caller()` を呼ぶのがポイントです。
 
-write_excel_result(ws, "B2", 0.32)           # 数値をそのまま保存
-write_excel_result(ws, "B3", np.nan)        # Excel B3に =NA() → #N/A
-write_excel_result(ws, "B4", np.inf)        # Excel B4に =NA() → #N/A
+**手順 A-5. Excel上のボタンと疎通確認**
 
-# 列方向に一括出力（1次元配列は既定で縦方向）
-write_excel_result(ws, "D2", [0.30, np.nan, 0.51])
+[9.4](#94-excel上に計算実行ボタンを置く共通)の手順で、`00_計算管理` シートのフォームコントロールボタンに `RunMapsWithXlwings` を割り当てます。
+クリック後、管理シート `B2` に「完了」、`30_TV` と `31_Ps` に数値が更新されたら成功です。
 
-# 横方向に出力したい場合
-write_excel_result(ws, "F2", [0.30, np.nan, 0.51], orientation="row")
+### 9.3 方式B：VBAのコマンド実行でPythonを起動（xlwings不使用）
 
-# 2次元配列は指定された形のまま出力
-write_excel_result(ws, "H2", np.array([[1.0, np.nan], [3.0, 4.0]]))
+**重要： `RunPython` と `xw.Book.caller()` はこの方式では使いません。**
+VBAが `python.exe` を直接実行し、保存済みの `.xlsm` を `openpyxl` が読み、出力用の別 `.xlsx` を書きます。VBAがその結果を現在開いているExcelへ取り込みます。
 
-wb.app.calculate()
+計算中のPythonが、VBAで処理中のExcelへ直接COM接続して書き込もうとすると、競合や待機が起こり得ます。そこでこの例では、**ファイル受け渡し方式**にして安定性を優先しています。
+
+**手順 B-1. Python環境とファイルを準備する**
+
+9.1の構成にしたうえで、次を確認します。
+
+```bat
+C:\AircraftPerformance\.venv\Scripts\python.exe
+C:\AircraftPerformance\src\run_without_xlwings.py
+```
+
+`src/run_without_xlwings.py` は**この配布物に含まれる**ため、新たに作る必要はありません。
+
+**手順 B-2. コマンドプロンプトで単独実行を確認する**
+
+一度Excelで `AircraftPerformance.xlsm` を**保存**してから、次を実行します。
+
+```bat
+cd /d C:\AircraftPerformance
+.venv\Scripts\python.exe src\run_without_xlwings.py AircraftPerformance.xlsm results_manual.xlsx
+```
+
+成功すると、`results_manual.xlsx` に `30_TV`、`31_Ps`、`00_計算管理` の結果シートが生成されます。元の `AircraftPerformance.xlsm` はPythonから**上書きしません**。
+エラー時は `results_manual.error.txt` に詳細が記録されます。
+
+**手順 B-3. VBAモジュールを取り込む**
+
+`excel_vba/RunMaps_without_xlwings.bas` を、`Alt + F11 → ファイル → ファイルのインポート` で `AircraftPerformance.xlsm` に追加します。
+このモジュールは**xlwingsの関数を使いません**。
+コード内で呼ぶコマンドの中心は次のとおりです。
+
+```vb
+pyExe = ThisWorkbook.Path & "\.venv\Scripts\python.exe"
+scriptPath = ThisWorkbook.Path & "\src\run_without_xlwings.py"
+
+command = """" & pyExe & """ """ & scriptPath & """ """ & _
+          ThisWorkbook.FullName & """ """ & resultPath & """"
+
+ret = CreateObject("WScript.Shell").Run(command, 1, True)
+```
+
+最後の `True` はPythonの終了まで待機する指定です。`Shell` だけでは原則として完了を待たないため、ここでは `WScript.Shell.Run` を使います。
+**上の抜粋のみでは結果の取り込み処理がありません。** 配布した `.bas` ファイルには、次の処理まで実装しています。
+
+1. Excelの数式を再計算して `ThisWorkbook.Save` で保存する。
+2. VBAからPythonのコマンドを起動し、完了まで待つ。
+3. Pythonの終了コードと出力ファイルの有無を確認する。
+4. 一時 `.xlsx` を読み、`30_TV` と `31_Ps` の結果を開いているExcelにコピーする。
+5. `=NA()` を **数式として**コピーし、`#N/A` を維持する。
+6. Excelを再計算・保存し、完了メッセージを表示する。
+
+Python側は `openpyxl.load_workbook(path, data_only=True)` を使うため、Excel数式の**計算済みの値**を読み込みます。`openpyxl` 自身にExcel数式を再計算する機能はありません。式を変更した後はExcelで再計算し、**保存してから**Pythonへ渡す必要があります。このためVBAが計算前に保存します。
+
+**手順 B-4. ボタンへ登録・実行する**
+
+[9.4](#94-excel上に計算実行ボタンを置く共通)に従い、`00_計算管理` のボタンに `RunMapsWithoutXlwings` を割り当てます。
+結果表とグラフが更新されれば成功です。
+
+**本方式の注意点：**
+
+- `ThisWorkbook.Path` に `.venv` と `src` があることが前提です。異なる配置なら `.bas` 内のパスを変更してください。
+- Excelが開いている**同じ `.xlsm` をPythonのopenpyxlで上書きしません**。これによりマクロ・図形・グラフの破損やファイル競合を避けます。
+- Excelの `=NA()` は `openpyxl` の読み込みではExcelのエラー値として現れ、補間クラスの欠損値処理の対象になります。
+- VBAによる読み戻しでは計算結果の **A5:E10005 / A5:D10005** 領域を更新します。グラフをその領域に配置しないでください。
+- ログはWindowsの `%TEMP%` 下に出力するため、機密データを扱う環境ではログファイルの保存・削除ポリシーを決めてください。
+
+### 9.4 Excel上に「計算実行」ボタンを置く（共通）
+
+**手順：**
+
+1. `AircraftPerformance.xlsm` をExcelで開きます。**デスクトップ版**を使用してください。
+2. `[ファイル] → [オプション] → [リボンのユーザー設定]` で `[開発]` にチェックを入れます。
+3. `Alt + F11` でVBAエディターを開き、方式AまたはBのマクロが標準モジュールに登録されているか確認します。
+4. Excelの `00_計算管理` シートへ戻り、`[開発] → [挿入] → [フォームコントロール] → [ボタン]` を選びます。
+5. シート上でドラッグし、ボタンを配置します。
+6. 「マクロの登録」で、方式Aなら `RunMapsWithXlwings`、方式Bなら `RunMapsWithoutXlwings` を選択し `[OK]` を押します。
+7. ボタンを右クリックして文字を `T–V / Ps 計算実行` に変更します。
+8. `Ctrl + S` で `.xlsm` のまま保存します。
+9. Excelの入力を設定してボタンをクリックします。正常なら `00_計算管理!B2` が「完了」になり、出力表を参照するXY散布図が更新されます。
+
+**注意：** ボタンを通常クリックすると登録マクロが実行されます。割り当てを修正するときは、ボタンを右クリックして `[マクロの登録]` を選びます。ActiveXコントロールである必要はありません。
+
+### 9.5 共通の確認項目・トラブルシューティング
+
+| 症状 | 確認箇所 |
+|---|---|
+| `RunPython` が未定義 | **方式A**：StandaloneのVBAモジュールがブックに組み込まれているか確認。方式Bは `RunPython` 不要 |
+| `No module named main` | **方式A**：`PYTHONPATH` が `...\src` を指すか確認 |
+| `No module named scipy` / `xlwings` | `INTERPRETER_WIN` のPythonと `pip install` したPythonが一致しているか確認 |
+| `Book.caller()` に接続できない | **方式A**：必ずExcelの `RunPython` から呼ぶ。方式Bでは使わない |
+| `.venv\Scripts\python.exe` が見つからない | **方式B**：VBAの `pyExe` パスと環境を確認 |
+| `.xlsx` の結果が作られない | **方式B**：`%TEMP%` の `.error.txt` を確認、単独コマンドで再現する |
+| 読み込んだExcel数式セルが空 | **方式B**：Excelで再計算→保存してから実行。`openpyxl` は数式を計算しない |
+| マクロを実行できない | Excelのマクロ設定、ファイルの信頼性、組織のポリシーを管理者と確認 |
+| 結果表は変わるがグラフが更新されない | Excelのグラフ系列が `30_TV` / `31_Ps` の正しい結果範囲を参照しているか確認 |
+
+**安全性について：** VBAマクロと外部プログラムの起動は、信頼できるプロジェクトでのみ許可してください。ネット経由のマクロファイルが既定でブロックされる環境もあります。セキュリティ設定を一律に無効化することは推奨しません。
+
+### 9.6 関連する公式資料
+
+- [xlwings：Add-in & Settings / Standalone VBA module](https://docs.xlwings.org/en/stable/addin.html)
+- [xlwings：RunPython](https://docs.xlwings.org/en/stable/vba.html)
+- [xlwings：Quickstart](https://docs.xlwings.org/en/stable/quickstart.html)
+- [Microsoft：フォームコントロールボタンにマクロを割り当てる](https://support.microsoft.com/ja-jp/excel/assign-a-macro-to-a-form-or-a-control-button)
+- [Microsoft：インターネットから取得したマクロファイルのブロック](https://learn.microsoft.com/ja-jp/microsoft-365-apps/security/internet-macros-blocked)
+
+---
+
+## 10. グラフの自動管理：`utils/excel_charts.py`
+
+今回追加した `src/utils/excel_charts.py` は、**Pythonで計算済みのExcel表を参照するXY散布図**を作成・更新する関数群です。グラフの画像ファイルは生成しません。
+
+**対応環境：Windows版デスクトップExcel + xlwings（Classic）**。ExcelのCOMネイティブAPIを使用します。macOS版Excel・Web版Excel・Excelなし環境では、このモジュールのグラフ操作は使用できません。VBAからの実行は前章の「xlwings Standalone方式」を利用できます。
+
+### 10.1 使い分け
+
+| API | 用途 |
+|---|---|
+| `update_chart_from_table(...)` | 1枚のシートの共通X列と複数Y列。T–V、Psなど |
+| `update_xy_chart(...)` | 複数シート・異なるX列や行数の系列。生データと補間曲線の重ね表示など |
+| `ExcelSeriesSpec(...)` | 各系列のシート名、列名、データ範囲、線／マーカーを定義 |
+| `write_chart_table(...)` | 補間曲線など、グラフ専用の出力テーブルを更新（NaN → `=NA()`） |
+
+### 10.2 T–V線図／Ps線図：行数が変わっても自動で同期
+
+`main.py` に新たに `run_maps_with_charts()` を追加しました。これは既存の `run_maps()` でデータ計算・Excel出力を行った後、グラフも更新する入口です。
+
+VBAのマクロ（xlwings Standaloneまたはアドイン方式）を次のようにします。
+
+```vb
+Sub RunMapsWithCharts()
+    RunPython "import main; main.run_maps_with_charts()"
+End Sub
+```
+
+このボタンを押すと、`30_TV!A5` と `31_Ps!A5` にある計算表を参照し、それぞれのシートに `TV_chart` と `Ps_chart` というXY散布図を作成／更新します。**既存グラフの位置や軸などは基本的に維持し、系列の参照範囲のみ現在の行数へ更新**します。
+
+同じ処理を個別に呼ぶ場合：
+
+```python
+from utils.excel_charts import update_chart_from_table
+
+update_chart_from_table(
+    wb,
+    chart_sheet="30_TV",         # Excelグラフの置き場所
+    chart_name="TV_chart",       # 作成／更新するグラフ名
+    data_sheet="30_TV",          # データ表のあるシート
+    header_cell="A5",            # 見出し行の左端
+    x_column="V",                # Excel上の列名
+    y_columns=["T_required", "T_available"],
+    row_count=len(tv_df),          # 行数を明示。Noneなら自動検出
+    title="T–V",
+)
+```
+
+- **各系列の横軸は数値のX軸**です。Excelの「折れ線グラフ（カテゴリ軸）」ではありません。
+- `y_columns` を増減すると、系列が追加・削除されます。
+- `row_count=None` なら、`header_cell` から連続する表の行数を検出します。途中に完全空白行がある場合や、隣接する別の表がある場合は、`row_count` を明示する方が確実です。
+- グラフを含むブックへの保存は `wb.save()` で実行します。
+- この機能は**Excelに結果が既に書き込まれていること**が前提です。`run_maps_with_charts()` は出力と更新を順番に行います。
+
+### 10.3 生データ（マーカー）と補間曲線（実線）を別シートから重ねる
+
+**例のExcelシート構成：**
+
+- `10_空力DB!A1`：`alpha`, `Mach`, `CL` などの生データ（元DB）
+- `41_生値断面!A1`：指定Machだけに抽出した `alpha`, `CL`（Pythonが生成）
+- `41_補間データ!A1`：`alpha`, `CL` の補間評価点（Pythonが生成）
+- `40_グラフ`：可視化用シート（事前に作成）
+
+```python
+from utils.excel_charts import ExcelSeriesSpec, update_xy_chart
+
+update_xy_chart(
+    wb,
+    chart_sheet="40_グラフ",
+    chart_name="CL_interpolation_check",
+    title="CL–alpha 補間確認",
+    series_specs=[
+        ExcelSeriesSpec(
+            name="CL：生データ",
+            sheet_name="41_生値断面",
+            x_column="alpha", y_column="CL",
+            header_cell="A1", row_count=len(raw_slice),
+            mode="markers",
+        ),
+        ExcelSeriesSpec(
+            name="CL：補間曲線",
+            sheet_name="41_補間データ",
+            x_column="alpha", y_column="CL",
+            header_cell="A1", row_count=len(curve_df),
+            mode="lines",
+        ),
+    ],
+)
 wb.save()
 ```
 
-## 関数の引数
-
-| 引数 | 意味 |
-|---|---|
-| `sheet` | xlwingsのSheet（`wb.sheets["計算結果"]` など） |
-| `start_cell` | 出力開始セル。例：`"B2"` |
-| `values` | スカラー、1次元リスト/NumPy配列、2次元リスト/NumPy配列 |
-| `orientation` | 1次元の場合の方向。既定 `"column"`、横方向なら `"row"` |
-
-空欄 `None` は `#N/A` にせず空欄のまま書き込みます。文字列はそのまま書き込みます。
-入力が3次元以上の場合や、空の配列の場合は `ValueError` となります。
-変換はExcelへの出力時にのみ行い、元のNumPy配列は変更しません。
-
-内部では通常の数値をまず範囲単位で書き込み、非有限値のセルにだけ
-`=NA()` 数式を書き込みます。このため非有限値のセルが非常に多い大きな
-配列ではExcelへの個別操作が増え、処理時間が長くなる可能性があります。
-
-**グラフでの注意**：Excelのグラフは通常 `#N/A` を欠損値として扱えますが、
-表示方法はグラフ種別・Excelの設定に依存するため、実機で確認してください。
-
-## `main.py` での利用
+**重要：** 生データにMachや舵角など他の条件が混在する場合、`10_空力DB` の全行をそのまま重ねてはいけません。補間曲線がMach=0.2の断面なら、生データもMach=0.2だけに絞り、必要ならグラフ専用データシートに書いてください。行をフィルタするだけで連続範囲にならない場合、元DBを直接グラフ参照せず、以下のように専用の2列に抽出します。
 
 ```python
-from utils.excel_io import write_excel_result
+import numpy as np
+import pandas as pd
+from utils.excel_charts import write_chart_table
 
-# 補間結果にも求根結果にも同じ書き込み関数を使用
-write_excel_result(wb.sheets["計算結果"], "B2", aero_result["CL"])
-write_excel_result(wb.sheets["交点結果"], "B2", solution.x)
-write_excel_result(wb.sheets["交点結果"], "B3", solution.residual)
+raw_slice = raw_df.loc[
+    np.isclose(pd.to_numeric(raw_df["Mach"], errors="coerce"), 0.2)
+    & raw_df["CL"].notna(),
+    ["alpha", "CL"],
+].sort_values("alpha")
+write_chart_table(wb.sheets["41_生値断面"], raw_slice, start_cell="A1")
 ```
 
-本実装は `xlwings` Classic のデスクトップExcel操作を想定しています。
-テストはExcelオブジェクトを模したモデルで行い、Excel実機での表示は未検証です。
+`write_chart_table` は**専用の結果領域**にのみ使ってください。以前の表範囲を消去してから書き直すため、ほかの入力・式が同じ表領域に存在すると消去されます。出力列のNaN/±infは既存の `excel_io.write_excel_result()` を通して `=NA()` へ変換します。
+
+### 10.4 注意事項
+
+- グラフ名はExcelの**グラフオブジェクト名**です（タイトルの文字列とは別）。
+- XY散布図の「線」はPythonで評価した点をExcel上で直線で結んだものです。**Excel独自の平滑化は使用しません**。
+- 既存グラフの系列をこの関数が管理します。`series_specs` にない系列は削除されるため、手動で追加した系列も残したい場合は仕様に含めてください。
+- グラフや入力欄が出力表を上書きしないよう、位置を分けてください。
+- ExcelのCOMによるグラフ操作の**実機での動作確認は未実施**です。まずテスト用ブックで実行してください。
+
+## 11. PlotlyによるHTML可視化：`utils/plotly_charts.py`
+
+`src/utils/plotly_charts.py` は、**保存済みデータや計算済みのDataFrameから、Excelに追加のグラフ用データを書き込まずに**ブラウザ向けHTMLを生成します。Excelアドイン・Excel本体・xlwingsは不要です。
+
+HTMLは `include_plotlyjs=True` による**単独オフラインファイル**です。受け取り側はPython環境がなくてもブラウザで開き、拡大・縮小・ホバー・凡例から系列の表示/非表示などを操作できます。
+
+**注意：** HTMLは生成時点のデータを埋め込んだスナップショットで、元のExcelやCSVを変更しても自動更新されません。また、**数値データがHTML内に含まれる**ため、機密データの共有範囲に注意してください。
+
+### 11.1 T–V・PsなどのXY線図
+
+```python
+from pathlib import Path
+from utils.plotly_charts import export_xy_html
+
+# 計算済みの tv_df はDataFrame
+out = export_xy_html(
+    tv_df,
+    x_column="V",
+    y_columns=["T_required", "T_available"],
+    title="T–V",
+    x_label="V [m/s]",
+    y_label="Thrust [N]",
+    output_html=Path("reports") / "TV.html",
+)
+print(out)
+```
+
+Excelへの出力とは独立しているので、T–Vの行数が変わってもコードを変える必要はありません。`#N/A`やNaNはグラフに描画しません。
+
+### 11.2 補間確認（生データと評価曲線）
+
+```python
+import numpy as np
+import pandas as pd
+from utils.plotly_charts import export_interpolation_html
+
+# raw_slice: Mach等を固定して抽出した生データDataFrame
+alpha = np.linspace(0, 15, 201)
+cl = aero_interp.predict(alpha=alpha, Mach=0.2)["CL"]
+curve_df = pd.DataFrame({"alpha": alpha, "CL": cl})
+
+export_interpolation_html(
+    raw_slice, curve_df,
+    x_column="alpha", y_columns=["CL"],
+    output_html="reports/CL_interpolation.html",
+)
+```
+
+生データは丸マーカー、補間曲線は同じ色の線で表示します。複数の空力係数にも対応します。
+
+### 11.3 Psの高度–速度コンター
+
+```python
+from utils.plotly_charts import export_contour_html
+
+export_contour_html(
+    ps_map_df,                # 列 V, Altitude, Ps を持つDataFrame
+    x_column="V",
+    y_column="Altitude",
+    z_column="Ps",
+    output_html="reports/Ps_contour.html",
+)
+```
+
+- この関数は **(V, Altitude) の規則格子**を想定します。同一点が重複するとエラーです。
+- 格子の欠損は空白（穴）として扱い、関数内部で勝手な外挿はしません。
+- 不規則な散在点からコンターを作る場合は、事前に `ExcelInterpolator` 等で適切な格子に補間してから渡してください。
+
+### 11.4 使用API
+
+| API | 処理 |
+|---|---|
+| `build_xy_figure(data, ...)` | Plotly Figure を生成（保存しない） |
+| `export_xy_html(data, ...)` | T–V等のXY HTMLを生成 |
+| `export_interpolation_html(raw_data, curve_data, ...)` | 生値点＋補間曲線を重ねるHTML |
+| `export_contour_html(data, ...)` | 規則格子の2DコンターHTML |
+| `save_html(fig, path)` | 作成済みFigureを完全オフラインHTMLへ保存 |
+
+依存関係： `plotly`、`pandas`、`numpy`。`requirements.txt` および `requirements_without_xlwings.txt` にPlotlyを追加済みです。
+
+### 11.5 ExcelからHTML生成を呼び出す場合
+
+- **xlwings Standalone方式：** Pythonで性能結果DataFrameを計算した直後に `export_xy_html(df, ...)` を呼べます。
+- **Python直接起動方式：** `run_without_xlwings.py` の計算結果DataFrameをHTML出力関数に渡せます。Excelへセルを書き戻す必要はありません。
+- 通常の `main.run_maps()` は従来と同じ動作のままです。Excelグラフまで更新したい場合のみ `main.run_maps_with_charts()` を選んでください。
+
+## 12. グラフAPIの参考情報
+
+- [xlwings Charts](https://docs.xlwings.org/en/stable/api/charts.html)
+- [Microsoft Excel: Series.XValues](https://learn.microsoft.com/en-us/office/vba/api/excel.series.xvalues)
+- [Microsoft Excel: SeriesCollection.NewSeries](https://learn.microsoft.com/en-us/office/vba/api/excel.seriescollection.newseries)
+- [Plotly Python: write_html](https://plotly.com/python-api-reference/generated/plotly.io.write_html.html)
+
+---
+
+## 12. PsのMach-高度等値線：長形式データ1枚から任意のG・等値線を描く（v7）
+
+### 基本的な考え方
+
+**レベルごとにシートを分割しない。** 2次元・3次元パラメータスタディの結果は、
+「1行＝1計算条件」で同じデータ表にまとめる。例えば `31_PsMap` シートのA1から：
+
+| Altitude | Mach | G | Ps |
+|---:|---:|---:|---:|
+| 0 | 0.2 | 1 | 15.2 |
+| 0 | 0.4 | 1 | 22.5 |
+| 1000 | 0.2 | 1 | 12.1 |
+| 1000 | 0.4 | 1 | 19.3 |
+| 0 | 0.2 | 2 | 5.8 |
+| ... | ... | ... | ... |
+
+行順序がばらばらでもよい。`G=1` を選択して断面を作り、`Ps=0,10,20` の線は
+`Ps` 数値場に対する等値線抽出アルゴリズムで計算する。**`Ps=10` の元行は不要**。
+
+```mermaid
+flowchart LR
+  A["31_PsMap：長形式データ（1枚）"] --> B["G=固定値を抽出／必要ならG補間"]
+  B --> C["Mach × Altitude のPs格子"]
+  C --> D["等値線Ps=0,10,20を抽出"]
+  D --> E["Excelグラフ：XY散布図"]
+  D --> F["Plotly：オフラインHTML"]
+```
+
+**前提：** 同一のG・高度・Machに対しPsは1つ。高度／Mach／G以外に重量や出力設定などの次元がある場合は、まずそれらも固定してからこの機能に渡す。混在して同一座標が重複するとエラーになり、異なる条件を誤って平均したり結合したりしない。
+
+### Excelのシート配置
+
+既存の `31_Ps` は1高度での `V-Ps` を表す別シートなので、ここでは新しいデータマップ `31_PsMap` を使う。
+
+| シート | 用途 | 列／セル |
+|---|---|---|
+| `31_PsMap` | **元のPs数値データ**。各Gの値を同じ表に保持 | A1から `Altitude`, `Mach`, `G`, `Ps` |
+| `33_Ps等値線設定` | 等値線の条件 | B2=固定G（例：1）、B3=レベル文字列（例：`0,10,20`）、B4=実行状態、B5=`exact`または`linear`、B6=`none`または`linear` |
+| `32_Ps等値線データ` | **自動生成専用**。等値線の各分離枝をX/Y 2列組で出力 | A1から自動更新。編集しないこと |
+| `40_グラフ` | ExcelネイティブXY散布図 | `Ps_contour_chart` が自動生成・更新 |
+
+固定Gの扱い：
+
+- `fixed_mode='exact'`（既定）：Gが元データに存在するときだけ表示。無い場合は明示的にエラー。
+- `fixed_mode='linear'`：例えばG=1とG=2の2断面からG=1.5を線形補間。ただし両断面で同一の高度・Mach座標が存在する箇所のみ対応。G範囲外への外挿なし。
+- 欠損 `#N/A` は数値格子ではNaNとして扱い、原則としてそこをまたいで等値線をつながない。
+- `resample='none'`（既定）：既存の高度・Mach格子をそのまま使用し、欠損セルはNaNのままにする。
+- `resample='linear'`：不規則な座標点からSciPyで格子を生成する（既定101×81点）。凸包外はNaN。失敗点・飛行不能域など意味のある穴を埋める可能性があるため、慎重に利用する。
+
+### Excelからの実行（xlwings Standalone / 通常アドイン）
+
+VBAの標準モジュールに、次のマクロを追加してフォームコントロールボタンに割り当てる。
+
+```vb
+Sub RunPsContours()
+    RunPython "import main; main.run_ps_contours()"
+End Sub
+```
+
+`src/main.py` の `run_ps_contours()` は、`31_PsMap` を `pandas.DataFrame` として読み込み、
+選択されたGと等値線レベルで描画を更新して保存する。Excelとの連携はxlwingsのみ。
+`PYTHONPATH` にはプロジェクト内の `src` を指定し、Python仮想環境に必要パッケージを入れる。
+
+WindowsデスクトップExcelのネイティブグラフを更新するため、Excel側のグラフ操作はWindows専用。
+Excelのデータ自体は再計算せず、**表示する断面と線図だけ変更**できる。
+
+### Pythonのみ：等値線を抽出する
+
+```python
+import pandas as pd
+from utils.contour_maps import prepare_contour_grid, extract_contour_lines
+
+df = pd.read_csv("ps_data.csv")
+grid = prepare_contour_grid(df, fixed_value=1.0)
+lines = extract_contour_lines(grid, levels=[0, 10, 20])
+
+# [G, Ps_level, segment_id, point_id, Mach, Altitude] の長形式
+print(lines.head())
+```
+
+`segment_id` が重要。**同じPsの等値線が複数の独立した枝を持つことがある。**
+枝を区別せず連結すると、存在しない線分が発生する。Excelでは枝ごとに別系列に分ける。
+
+### Pythonのみ：HTMLへ出力（Plotly）
+
+```python
+from utils.plotly_charts import export_isolines_html
+
+export_isolines_html(
+    df,
+    fixed_value=1.0,
+    levels=[0, 10, 20],
+    output_html="results/Ps_G1.html",
+    show_heatmap=True,
+)
+```
+
+`Plotly` は元Excelへ可視化用数値を書き戻さずにHTMLを生成可能。
+ブラウザ閲覧だけならPython不要。ただしHTMLは作成時のスナップショットであり、元Excelデータは変更しても自動更新されない。
+
+### Excelに可視化するPython API
+
+```python
+from utils.excel_charts import update_contour_chart_from_dataframe
+
+lines = update_contour_chart_from_dataframe(
+    wb,
+    df,
+    fixed_value=1.0,
+    levels=[0, 10, 20],
+    output_data_sheet="32_Ps等値線データ",
+    chart_sheet="40_グラフ",
+    chart_name="Ps_contour_chart",
+)
+```
+
+**Excel出力用は1枚の補助シートだけ**。レベル別／G別のシートは不要。
+再実行で等値線が増減しても、既存グラフを再利用して必要な系列を増減する。
+Excelグラフの各系列は同じ長さとは限らないので、2列1組（Mach、Altitude）を
+等値線の各枝ごとに作り、余った部分は空欄とする（別枝を誤接続しない）。
+
+### 動作確認用のサンプル
+
+```bash
+python examples/generate_ps_contours_demo.py
+```
+
+`examples/ps_data_demo.csv` と `examples/ps_contour_points_demo.csv`、
+`examples/Ps_contours_demo.html` が生成される。データは説明用の人工的な数値場で、実機性能ではない。
+
+### 限界と検証
+
+- ContourPyは**格子点のPsの補間に基づいて**等値線を抽出する。粗い格子や欠損、飛行不能領域では等値線の精度・連続性に注意。
+- 「G=固定、Ps=定数」の等値線を生成するもので、`Ps`を入力にした新たな性能計算・機体トリム解析は行わない。
+- Gが中間値の場合の線形補間は、重量・推力設定など他条件が同一であることを前提にする。
+- Excel上でグラフを使う部分はxlwingsとWindows COMを使用。テストではCOMを模擬しておりExcel実機でのボタン・グラフ描画は未検証。
+
+主なAPI参考：ContourPy（`contour_generator(...).lines(level)`）、
+SciPy（`griddata(..., method='linear')`）、Plotly（`go.Scatter`／`go.Heatmap`）。

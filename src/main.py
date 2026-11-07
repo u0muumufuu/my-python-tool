@@ -1,119 +1,187 @@
-"""Excel のボタンから呼ぶサンプル。
+"""Excelのボタンから実行する性能計算の入口。
 
-構成:
-  src/main.py
-  src/utils/interpolation.py
-  src/utils/solvers.py
-  src/utils/excel_io.py
+VBA: RunPython "import main; main.run_maps()"
+xlwingsのPYTHONPATH: このsrcフォルダを指定。
 
-Excel の xlwings 設定 PYTHONPATH をこの src フォルダに設定する。
-VBA: RunPython "import main; main.run()"
-
-必要シート (例):
-- 空力DB: D5 に alpha, Mach, CL, CD, Cm の見出し
-           → alpha, Mach の全組み合わせを含む直交格子
-- エンジンDB: A1 に RPM, Altitude, Power, FuelFlow の見出し
-- 計算条件: B2=alpha, B3=Mach, B4=RPM, B5=Altitude
-- 計算結果: B2:B4=CL,CD,Cm, B6:B7=Power,FuelFlow
+利用するExcelシート（詳細はREADME参照）:
+  00_計算管理
+  01_機体諸元 (B2: 質量[kg], B3: 主翼面積[m2])
+  03_飛行条件 (B2: 空気密度, B3: 音速, B4: 高度,
+               B5: 最小速度, B6: 最大速度, B7: 速度点数)
+  10_空力DB   (A1開始、alpha, Mach, CL, CD, Cm)
+  11_推進DB   (A1開始、V, Altitude, Thrust)
+  30_TV       (A5から結果出力)
+  31_Ps       (A5から結果出力)
 """
 
-import xlwings as xw
+from __future__ import annotations
 
-from utils.interpolation import ExcelInterpolator
-from utils.solvers import EquationSolver
+from datetime import datetime
+
+import numpy as np
+
+from models.aerodynamics import AerodynamicsModel
+from models.propulsion import PropulsionModel
+from analysis.performance_maps import calculate_tv_ps
 from utils.excel_io import write_excel_result
 
 
-def run() -> None:
-    # 呼出し元ブック (未保存の Excel セル変更も読み取る)
+def read_conditions(wb) -> dict:
+    """Excelの単純計算はExcel側で終え、確定したセル値をPythonに渡す。"""
+    airframe = wb.sheets["01_機体諸元"]
+    flight = wb.sheets["03_飛行条件"]
+    n = int(flight.range("B7").value)
+    if not 2 <= n <= 10000:
+        raise ValueError("速度の分割点数は2～10000としてください")
+    v_min = float(flight.range("B5").value)
+    v_max = float(flight.range("B6").value)
+    if not (0 < v_min < v_max):
+        raise ValueError("速度範囲は0 < 最小速度 < 最大速度を満たす必要があります")
+
+    return dict(
+        mass_kg=float(airframe.range("B2").value),
+        wing_area_m2=float(airframe.range("B3").value),
+        rho_kg_m3=float(flight.range("B2").value),
+        speed_of_sound_m_s=float(flight.range("B3").value),
+        altitude_m=float(flight.range("B4").value),
+        velocities_m_s=np.linspace(v_min, v_max, n),
+    )
+
+
+def _write_result_table(ws, columns: list[str], df) -> None:
+    """計算結果だけをA5以降に出力。既存のグラフは変更しない。"""
+    # この例は最大10000点を想定。古い結果を残さないため範囲を消去。
+    # グラフや入力欄はこの範囲の外に配置する。
+    ws.range(f"A5:{chr(ord('A') + len(columns) - 1)}10005").clear_contents()
+    ws.range("A5").value = [columns]
+    write_excel_result(ws, "A6", df[columns].to_numpy(dtype=object))
+
+
+def run_maps(*, update_charts: bool = False) -> None:
+    """VBAからT–V・Psを計算。update_charts=Trueならグラフも同期する。"""
+    import xlwings as xw  # Excelのないテスト環境でもモデルのテストが可能
+
     wb = xw.Book.caller()
-    wb.app.calculate()  # 入力セルが Excel 数式なら、読み取り前に再計算
+    control = wb.sheets["00_計算管理"]
+    control.range("B2").value = "計算中"
+    control.range("B4").value = ""
 
-    condition = wb.sheets["計算条件"]
-    alpha = float(condition.range("B2").value)
-    mach = float(condition.range("B3").value)
-    rpm = float(condition.range("B4").value)
-    altitude = float(condition.range("B5").value)
+    try:
+        wb.app.calculate()  # Excel数式の更新後に読み取る
+        conditions = read_conditions(wb)
 
-    aero = ExcelInterpolator(
-        excel_path=wb.fullname,
-        sheet_name="空力DB",
-        start_cell="D5",           # 省略すると A1
-        input_columns=["alpha", "Mach"],
-        output_columns=["CL", "CD", "Cm"],
-        method="regular_grid",
-        grid_method="linear",
-        workbook=wb,
-    )
-    engine = ExcelInterpolator(
-        excel_path=wb.fullname,
-        sheet_name="エンジンDB",
-        input_columns=["RPM", "Altitude"],
-        output_columns=["Power", "FuelFlow"],
-        method="rbf",
-        workbook=wb,
-    )
+        # DBから一度だけ補間器を作成し、両性能マップで共有。
+        aero = AerodynamicsModel(excel_path=wb.fullname, workbook=wb)
+        propulsion = PropulsionModel(excel_path=wb.fullname, workbook=wb)
+        df = calculate_tv_ps(aero, propulsion, **conditions)
 
-    # 補間器は一度構築し、何度 predict しても Excel の再読み込みは発生しない
-    aero_result = aero.predict(alpha=alpha, Mach=mach)
-    engine_result = engine.predict(RPM=rpm, Altitude=altitude)
+        # Pythonで計算を終えてから、Excelへ結果をまとめて出力。
+        _write_result_table(
+            wb.sheets["30_TV"],
+            ["V", "T_required", "T_available", "alpha", "status"], df,
+        )
+        _write_result_table(
+            wb.sheets["31_Ps"],
+            ["V", "Ps", "alpha", "status"], df,
+        )
 
-    result = wb.sheets["計算結果"]
-    write_excel_result(result, "B2", [
-        aero_result["CL"], aero_result["CD"], aero_result["Cm"]
-    ])
-    write_excel_result(result, "B6", [
-        engine_result["Power"], engine_result["FuelFlow"]
-    ])
+        if update_charts:
+            # ExcelネイティブXYグラフを再利用。行数の増減にも対応。
+            # 使用者がグラフを書式変更しても基本の配置・軸設定を保持。
+            from utils.excel_charts import update_chart_from_table
+            update_chart_from_table(
+                wb, chart_sheet="30_TV", chart_name="TV_chart",
+                data_sheet="30_TV", header_cell="A5", row_count=len(df),
+                x_column="V", y_columns=["T_required", "T_available"],
+                title="T–V",
+            )
+            update_chart_from_table(
+                wb, chart_sheet="31_Ps", chart_name="Ps_chart",
+                data_sheet="31_Ps", header_cell="A5", row_count=len(df),
+                x_column="V", y_columns=["Ps"], title="Ps–V",
+            )
 
-    wb.app.calculate()  # これらの出力値を参照する Excel 数式を更新
-    wb.save()           # グラフや値を含めてブックに保存
+        wb.app.calculate()  # 書き込まれた値に依存するExcel数式とグラフを更新
+        control.range("B2").value = "完了"
+        control.range("B3").value = datetime.now()
+        control.range("B4").value = f"正常 {int((df['status'] == 'OK').sum())}/{len(df)} 点"
+        wb.save()
+    except Exception as exc:
+        # 途中で失敗した場合は、結果が前回のものか一部更新された可能性を明示。
+        control.range("B2").value = "エラー（結果要確認）"
+        control.range("B4").value = f"{type(exc).__name__}: {exc}"[:300]
+        wb.save()
+        raise
 
+
+def run_maps_with_charts() -> None:
+    """Excelボタン用: 数値を保存した後にグラフの系列範囲も更新する。"""
+    run_maps(update_charts=True)
+
+
+def run_all() -> None:
+    """現段階はマップ計算のみ。今後、各プロファイルを順次追加する。"""
+    run_maps()
+
+
+def run() -> None:
+    """v5 の main.run() を維持する互換入口（既存シート構成向け）。"""
+    import importlib
+    import legacy_examples
+    legacy_examples.xw = importlib.import_module("xlwings")
+    legacy_examples.run()
 
 
 def run_intersection_example() -> None:
-    """同じExcel表に記録した2曲線 f(x), g(x) の交点 f-g=0 を求める例。
+    """v5 の交点計算例を維持する互換入口。"""
+    import importlib
+    import legacy_examples
+    legacy_examples.xw = importlib.import_module("xlwings")
+    legacy_examples.run_intersection_example()
 
-    必要シート:
-    - 「交点DB」: A1から x, f, g のヘッダーとデータ
-      例: x=0,1,2,3,4 / f=2*x+1 / g=0.5*x+4
-    - 「交点結果」: B2に解 x、B3に f-g の残差、B4に手法を出力
 
-    VBA から: RunPython "import main; main.run_intersection_example()"
+def run_ps_contours() -> None:
+    """Excelのボタン用: 31_PsMapの長形式データからG固定のPs等値線を更新。
+
+    31_PsMap: A1から [Altitude, Mach, G, Ps] （行順自由）
+    33_Ps等値線設定: B2 = G固定値, B3 = レベルのCSV文字列（例: 0,10,20）
+    32_Ps等値線データ: 等値線XY座標の自動出力専用シート
+    40_グラフ: Ps_contour_chart が生成/更新される
+
+    計算結果そのもののPsデータを変更せず可視化のみ更新する。
     """
+    import pandas as pd
+    import xlwings as xw
+    from utils.excel_charts import update_contour_chart_from_dataframe
+
     wb = xw.Book.caller()
     wb.app.calculate()
 
-    f_interp = ExcelInterpolator(
-        excel_path=wb.fullname,
-        sheet_name="交点DB",
-        input_columns=["x"],
-        output_columns="f",
-        method="pchip",
-        workbook=wb,
-    )
-    g_interp = ExcelInterpolator(
-        excel_path=wb.fullname,
-        sheet_name="交点DB",
-        input_columns=["x"],
-        output_columns="g",
-        method="pchip",
-        workbook=wb,
-    )
-
-    def difference(x: float) -> float:
-        return f_interp.predict(x=x)["f"] - g_interp.predict(x=x)["g"]
-
-    # 両補間器の定義域内で符号が反転する区間を指定
-    solution = EquationSolver(residual_tol=1e-8).solve(
-        difference, bracket=(0.0, 4.0)
-    )
-
-    output = wb.sheets["交点結果"]
-    # 求根以外の計算結果でも、NaN / ±inf は一律 Excel の #N/A にする。
-    write_excel_result(output, "B2", solution.x)
-    write_excel_result(output, "B3", solution.residual)
-    output.range("B4").value = solution.method
-    output.range("B5").value = "OK" if solution.converged else solution.message
-    wb.app.calculate()
+    data = wb.sheets["31_PsMap"].range("A1").options(
+        pd.DataFrame, index=False, expand="table"
+    ).value
+    config = wb.sheets["33_Ps等値線設定"]
+    g = float(config.range("B2").value)
+    levels = [float(s.strip()) for s in str(config.range("B3").value).split(",")]
+    fixed_mode = str(config.range("B5").value or "exact").strip().lower()
+    resample = str(config.range("B6").value or "none").strip().lower()
+    config.range("B4").value = "描画処理中"
+    try:
+        lines = update_contour_chart_from_dataframe(
+            wb, data,
+            fixed_value=g,
+            levels=levels,
+            fixed_mode=fixed_mode,
+            resample=resample,
+            output_data_sheet="32_Ps等値線データ",
+            chart_sheet="40_グラフ",
+            chart_name="Ps_contour_chart",
+        )
+        n_branches = lines.groupby(["Ps_level", "segment_id"]).ngroups
+        config.range("B4").value = f"完了: {len(levels)}レベル / {n_branches}曲線"
+        wb.app.calculate()
+    except Exception as exc:
+        config.range("B4").value = f"ERROR（グラフ要確認）: {type(exc).__name__}: {exc}"[:255]
+        wb.save()
+        raise
     wb.save()

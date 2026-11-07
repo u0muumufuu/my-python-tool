@@ -1,25 +1,20 @@
-# 検証結果（v5）
+# テスト結果（Ps等値線機能 v7）
 
-検証環境：Python 3.13 / NumPy 2.3.5 / SciPy 1.17.0 / pandas 2.2.3 / openpyxl 3.1.5 / pytest 9.0.2
+- 環境：Python 3.13, NumPy 2.3.5, pandas 2.2.3, SciPy 1.17.0, Plotly 6.5.2, ContourPy 1.3.3, openpyxl 3.1.5
+- 実行コマンド：`pytest -q --disable-warnings`
+- 結果：**108 passed, 2 warnings**
+- 構文チェック：`python -m compileall -q src tests examples` 成功
 
-実行コマンド：
+主な追加検証：
+- 順序が混在した長形式 `Altitude, Mach, G, Ps` の断面抽出
+- Ps=固定値に等しい生データがなくても、等値線座標を抽出
+- G値の線形補間（ただしG方向の外挿は拒否）
+- 同一点の重複検出と欠損のマスク
+- 不規則格子の線形再格子化と凸包外のNaN
+- 分離枝の検出と、Excelの枝ごとXY系列作成
+- Excelグラフの更新時に、系列数が減る場合の余剰系列削除（模擬COM）
+- オフラインPlotly HTMLの実生成・レベル表示
+- 以前の補間・収束計算・Excel入出力の回帰テスト
 
-```bash
-python -m pytest -q tests/
-python -m doctest src/utils/solvers.py
-python -m compileall -q src tests
-```
-
-結果：**66 passed**。doctest および構文チェックも正常終了。
-
-v5 で追加・変更した主な検証項目：
-- 2つ以上の出力列で1列のみが Excel の `=NA()` / `#N/A` / 空欄 / `np.nan` になった場合、他の列のデータは保持される。
-- RBF、規則格子（欠損列のみ散在点に切替）、線形散在点、最近傍、1次元PCHIPの欠損値処理。
-- `.xlsm` に `=NA()` を保存したセルを `data_only=True` で読み込む場合の対応。
-- 有効点のない出力／点数が不足する出力は `np.nan` を返し、他の出力は正常に評価できる。
-- 入力座標に欠損がある行は全出力で除外する。
-- 不正な文字列や入力格子点そのものが欠けた場合のエラー。
-- Excelブックを模擬した未保存データと `reload()` の動作。
-- v4 の収束計算、Excel 出力、`main.py` とその他の回帰テスト。
-
-注意：**実際のデスクトップ版Excelでのxlwings/VBA呼び出しは未検証**です（Excel実機を使用できない環境のため）。
+**未実施：** Windows版Excel実機とVBAボタンのE2E試験。グラフ作成・更新は模擬COMで検証。
+**留意：** デモ数値は航空機実測・推算データではなく説明用の人工データ。
