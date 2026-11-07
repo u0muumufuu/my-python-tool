@@ -1,4 +1,4 @@
-# Excel + Python 航空機性能推算：構成例
+# Excel + Python 推算：構成例
 
 **目的**：Excel (`.xlsm`) を入力・特性DB・結果表・グラフに使い、Pythonを補間・求根・性能計算のエンジンにする。
 
@@ -8,8 +8,8 @@
 
 ```mermaid
 flowchart LR
-  E["Excel：AircraftPerformance.xlsm<br/>・00_計算管理（実行ボタン）<br/>・01_機体諸元 / 03_飛行条件<br/>・10_空力DB / 11_推進DB<br/>・30_TV / 31_Ps（結果表・グラフ）"]
-  P["Python：src/<br/>・main.py（実行管理）<br/>・models/aerodynamics.py・propulsion.py<br/>・analysis/performance_maps.py<br/>・utils/interpolation.py・solvers.py・excel_io.py"]
+  E["Excel：per.xlsm<br/>・00_計算管理（実行ボタン）<br/>・01_機体諸元 / 03_飛行条件<br/>・10_空力DB / 11_推進DB<br/>・30_TV / 31_Ps（結果表・グラフ）"]
+  P["Python：src/<br/>・main.py（実行管理）<br/>・models/aerodynamics.py・propulsion.py<br/>・analysis/per_maps.py<br/>・utils/interpolation.py・solvers.py・excel_io.py"]
   E -->|"RunPython / 入力条件・特性データ"| P
   P -->|"計算結果 / 状態・残差 / 保存"| E
 ```
@@ -17,8 +17,8 @@ flowchart LR
 ## 2. フォルダ構造
 
 ```text
-AircraftPerformance/
-├── AircraftPerformance.xlsm      # 利用者が用意（このZIPには含めない）
+per/
+├── per.xlsm      # 利用者が用意（このZIPには含めない）
 ├── src/
 │   ├── main.py                  # RunPythonからの入口
 │   ├── legacy_examples.py       # 過去のmain.run() 等の互換用
@@ -26,7 +26,7 @@ AircraftPerformance/
 │   │   ├── aerodynamics.py      # 空力DBから係数補間モデルを1回構築
 │   │   └── propulsion.py        # 推進DBから推力補間モデルを1回構築
 │   ├── analysis/
-│   │   └── performance_maps.py  # T–V、Ps の簡易計算
+│   │   └── per_maps.py  # T–V、Ps の簡易計算
 │   └── utils/
 │       ├── interpolation.py     # 既存のExcelInterpolator（v5そのまま）
 │       ├── solvers.py           # 既存のEquationSolver
@@ -84,7 +84,7 @@ df = calculate_tv_ps(
 
 ## 4. Excel側の実行ボタン
 
-`AircraftPerformance.xlsm` の標準モジュールに以下を登録し、フォームコントロールのボタンに割り当てます。
+`per.xlsm` の標準モジュールに以下を登録し、フォームコントロールのボタンに割り当てます。
 
 ```vb
 Sub RunMaps()
@@ -94,7 +94,7 @@ End Sub
 
 xlwingsアドイン（またはStandalone VBAモジュール）の設定で、**PYTHONPATHにこのプロジェクトの `src` フォルダ**を設定してください。
 
-例：`C:\AircraftPerformance\src`
+例：`C:\per\src`
 
 `xw.Book.caller()` がボタンを押したブックを参照するため、Excelパスを `main.py` に固定する必要はありません。Python環境の配置と実行権限、xlwingsアドインまたはStandaloneモジュール、マクロ許可は別途必要です。
 
@@ -160,7 +160,7 @@ python -m pytest -q tests/
 ## 9. ExcelからPythonを起動する：アドイン不要の2方式（Windows版Excel）
 
 この節は、**Excelのボタンを押してPythonを動かし、T–V / Psの数値表をExcelに保存するまで**の再現手順です。
-`AircraftPerformance.xlsm` は利用者が作成します（この配布物には空の `.xlsm` を含めていません）。
+`per.xlsm` は利用者が作成します（この配布物には空の `.xlsm` を含めていません）。
 
 ### 9.1 どちらを選ぶか
 
@@ -184,8 +184,8 @@ Python実行環境は各PCに必要で、VBAと外部プログラム実行が会
 #### 共通：プロジェクト配置
 
 ```text
-C:\AircraftPerformance\
-├── AircraftPerformance.xlsm
+C:\per\
+├── per.xlsm
 ├── .venv\                     # Pythonの仮想環境（利用者が作成）
 │   └── Scripts\python.exe
 ├── src\
@@ -205,7 +205,7 @@ C:\AircraftPerformance\
 **共通の初期セットアップ：** Windowsの**コマンドプロンプト（cmd.exe）**で実行します。例ではWindowsの`py`コマンドを使います。
 
 ```bat
-cd /d C:\AircraftPerformance
+cd /d C:\per
 py -m venv .venv
 REM 方式Aの場合
 .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -225,32 +225,32 @@ xlwings公式の `--standalone` は、Excelアドインの代わりになるVBA�
 **手順 A-1. Standaloneの雛形を生成する**
 
 ```bat
-cd /d C:\AircraftPerformance
+cd /d C:\per
 .venv\Scripts\xlwings.exe quickstart StandaloneSeed --standalone
 ```
 
-`StandaloneSeed\StandaloneSeed.xlsm` などが生成されます。これは**既存の `AircraftPerformance.xlsm` を上書きするコマンドではありません**。既存ブックに組み込むための雛形です。
+`StandaloneSeed\StandaloneSeed.xlsm` などが生成されます。これは**既存の `per.xlsm` を上書きするコマンドではありません**。既存ブックに組み込むための雛形です。
 
 **手順 A-2. 内蔵VBAモジュールを既存ブックに移す**
 
-1. `StandaloneSeed.xlsm` と `AircraftPerformance.xlsm` を **Windows版Excel** で開く。
+1. `StandaloneSeed.xlsm` と `per.xlsm` を **Windows版Excel** で開く。
 2. `Alt + F11` でVBAエディターを開く。
 3. 左のプロジェクトエクスプローラーで雛形ブックの標準モジュールを確認し、xlwings用のモジュールを右クリックして **[ファイルのエクスポート]** で `.bas` を書き出す。
-4. `AircraftPerformance.xlsm` のプロジェクトを選び **[ファイル] → [ファイルのインポート]** で、その `.bas` を組み込む（同名モジュールが既にある場合は重複させない）。
+4. `per.xlsm` のプロジェクトを選び **[ファイル] → [ファイルのインポート]** で、その `.bas` を組み込む（同名モジュールが既にある場合は重複させない）。
 5. 雛形に含まれる専用の補助モジュールやクラスがあれば、それも必要に応じて移す。Windows版では通常は独立したVBAモジュールで利用できる。
-6. `AircraftPerformance.xlsm` を保存する。**.xlsmのまま保存**すること。
+6. `per.xlsm` を保存する。**.xlsmのまま保存**すること。
 
-> 新規作成なら `StandaloneSeed.xlsm` を `AircraftPerformance.xlsm` にリネームし、シートを追加して使い始めるほうが簡単です。既存ブックを使用する場合のみモジュール移植が必要です。
+> 新規作成なら `StandaloneSeed.xlsm` を `per.xlsm` にリネームし、シートを追加して使い始めるほうが簡単です。既存ブックを使用する場合のみモジュール移植が必要です。
 
 **手順 A-3. Pythonの場所とソースコードの場所を設定する**
 
-`AircraftPerformance.xlsm` に `xlwings.conf` という名前のワークシートを作り、次の2列で設定します。
+`per.xlsm` に `xlwings.conf` という名前のワークシートを作り、次の2列で設定します。
 （雛形の `_xlwings.conf` シートを利用する場合は、先頭の `_` を削除して `xlwings.conf` に変更してください。）
 
 | A列（設定キー） | B列（値の例） |
 |---|---|
-| `INTERPRETER_WIN` | `C:\AircraftPerformance\.venv\Scripts\python.exe` |
-| `PYTHONPATH` | `C:\AircraftPerformance\src` |
+| `INTERPRETER_WIN` | `C:\per\.venv\Scripts\python.exe` |
+| `PYTHONPATH` | `C:\per\src` |
 
 パスは**実際に配置したフォルダ**に変更します。仮想環境以外のPythonを使う場合は、その `python.exe` の実パスにします。ブックを別の場所に移動したら設定の変更が必要になることがあります。
 
@@ -302,27 +302,27 @@ VBAが `python.exe` を直接実行し、保存済みの `.xlsm` を `openpyxl` 
 9.1の構成にしたうえで、次を確認します。
 
 ```bat
-C:\AircraftPerformance\.venv\Scripts\python.exe
-C:\AircraftPerformance\src\run_without_xlwings.py
+C:\per\.venv\Scripts\python.exe
+C:\per\src\run_without_xlwings.py
 ```
 
 `src/run_without_xlwings.py` は**この配布物に含まれる**ため、新たに作る必要はありません。
 
 **手順 B-2. コマンドプロンプトで単独実行を確認する**
 
-一度Excelで `AircraftPerformance.xlsm` を**保存**してから、次を実行します。
+一度Excelで `per.xlsm` を**保存**してから、次を実行します。
 
 ```bat
-cd /d C:\AircraftPerformance
-.venv\Scripts\python.exe src\run_without_xlwings.py AircraftPerformance.xlsm results_manual.xlsx
+cd /d C:\per
+.venv\Scripts\python.exe src\run_without_xlwings.py per.xlsm results_manual.xlsx
 ```
 
-成功すると、`results_manual.xlsx` に `30_TV`、`31_Ps`、`00_計算管理` の結果シートが生成されます。元の `AircraftPerformance.xlsm` はPythonから**上書きしません**。
+成功すると、`results_manual.xlsx` に `30_TV`、`31_Ps`、`00_計算管理` の結果シートが生成されます。元の `per.xlsm` はPythonから**上書きしません**。
 エラー時は `results_manual.error.txt` に詳細が記録されます。
 
 **手順 B-3. VBAモジュールを取り込む**
 
-`excel_vba/RunMaps_without_xlwings.bas` を、`Alt + F11 → ファイル → ファイルのインポート` で `AircraftPerformance.xlsm` に追加します。
+`excel_vba/RunMaps_without_xlwings.bas` を、`Alt + F11 → ファイル → ファイルのインポート` で `per.xlsm` に追加します。
 このモジュールは**xlwingsの関数を使いません**。
 コード内で呼ぶコマンドの中心は次のとおりです。
 
@@ -365,7 +365,7 @@ Python側は `openpyxl.load_workbook(path, data_only=True)` を使うため、Ex
 
 **手順：**
 
-1. `AircraftPerformance.xlsm` をExcelで開きます。**デスクトップ版**を使用してください。
+1. `per.xlsm` をExcelで開きます。**デスクトップ版**を使用してください。
 2. `[ファイル] → [オプション] → [リボンのユーザー設定]` で `[開発]` にチェックを入れます。
 3. `Alt + F11` でVBAエディターを開き、方式AまたはBのマクロが標準モジュールに登録されているか確認します。
 4. Excelの `00_計算管理` シートへ戻り、`[開発] → [挿入] → [フォームコントロール] → [ボタン]` を選びます。
