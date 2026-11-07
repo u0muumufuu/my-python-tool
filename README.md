@@ -1,4 +1,4 @@
-# Excel + Python 性能推算：構成例
+# My Tool
 
 **目的**：Excel (`.xlsm`) を入力・特性DB・結果表・グラフに使い、Pythonを補間・求根・性能計算のエンジンにする。
 
