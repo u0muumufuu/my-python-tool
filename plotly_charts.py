@@ -61,15 +61,20 @@ class InterpolationPlotSpec:
         横軸に使う入力列名。補間器の input_columns に含まれている必要がある。
     y_column : str
         縦軸に使う出力列名。補間器の output_columns に含まれている必要がある。
-    series_columns : Sequence[str], default ()
+    series_columns : Sequence[str] | str | None, default ()
         系列として振る入力列名。例: ["Mach"]。
+        系列なしなら [] または None。文字列 "Mach" も指定可。
     series_values : Sequence[Any] | None, default None
         系列値の指定。
         - series_columns が 1 個なら [0.2, 0.4, ...] のような配列
         - series_columns が複数なら [{"Mach":0.2, "Re":1e6}, ...] のような配列
         None の場合は raw_data から固定条件に合うユニーク値を自動取得する。
     fixed : Mapping[str, float], default {}
-        固定する入力列と値。例: {"beta": 0.0, "de": 0.0}
+        固定する入力列と値。例: {"beta": 0.0, "de": 0.0}。
+        入力列のうち、横軸・系列に使わない列はすべて固定する。
+        例: CL(alpha, Mach, beta, de) なら x=alpha, series=Mach,
+        fixed={"beta":0, "de":0}。系列なしの場合は
+        fixed={"Mach":0.2, "beta":0, "de":0}。
     x_range : tuple[float, float] | None, default None
         補間曲線を評価する x 範囲。None なら raw_data の該当断面の最小最大、
         raw が無い場合は補間器の訓練データ範囲を使用する。
@@ -88,7 +93,7 @@ class InterpolationPlotSpec:
     title: str
     x_column: str
     y_column: str
-    series_columns: Sequence[str] = field(default_factory=tuple)
+    series_columns: Sequence[str] | str | None = field(default_factory=tuple)
     series_values: Sequence[Any] | None = None
     fixed: Mapping[str, float] = field(default_factory=dict)
     x_range: tuple[float, float] | None = None
@@ -207,7 +212,51 @@ def export_interpolation_html(
 def _normalize_fixed(mapping: Mapping[str, Any] | None) -> dict[str, float]:
     if not mapping:
         return {}
-    return {str(k): float(v) for k, v in mapping.items()}
+    normalized = {str(k): float(v) for k, v in mapping.items()}
+    for key, value in normalized.items():
+        if not np.isfinite(value):
+            raise ValueError(f"fixed[{key!r}] は有限の数値で指定してください")
+    return normalized
+
+
+def _series_columns(value: Sequence[str] | str | None) -> list[str]:
+    """系列なし(None/[])、単列文字列、複数列の指定を共通化する。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    return list(value)
+
+
+def _validate_plot_dimensions(spec: InterpolationPlotSpec, input_columns: Sequence[str]) -> list[str]:
+    """1グラフに必要な全入力次元を、x / series / fixed に分配する。"""
+    inputs = list(input_columns)
+    series = _series_columns(spec.series_columns)
+    if spec.x_column not in inputs:
+        raise ValueError(f"x_column={spec.x_column!r} は補間器の入力列にありません")
+    if len(set(series)) != len(series):
+        raise ValueError(f"series_columns に重複があります: {series}")
+    invalid_series = sorted(set(series) - set(inputs))
+    invalid_fixed = sorted(set(spec.fixed) - set(inputs))
+    if invalid_series or invalid_fixed:
+        raise ValueError(
+            f"不明な入力列です: series_columns={invalid_series}, fixed={invalid_fixed}; "
+            f"使用可能な列={inputs}"
+        )
+    if spec.x_column in spec.fixed or spec.x_column in series:
+        raise ValueError("横軸列を fixed や series_columns に重複指定できません")
+    if set(series) & set(spec.fixed):
+        raise ValueError("series_columns と fixed の条件列が重複しています")
+    missing = [n for n in inputs if n != spec.x_column and n not in series and n not in spec.fixed]
+    if missing:
+        raise ValueError(
+            f"グラフ {spec.title!r} の入力列 {missing} が未指定です。"
+            f"fixed={{...}} または series_columns=[...] に指定してください。"
+            f"系列なしにする場合は series_columns=[] とし、残りの全列を fixed に指定します。"
+        )
+    if not series and spec.series_values is not None and len(spec.series_values) > 0:
+        raise ValueError("系列なしのとき series_values は None または [] にしてください")
+    return series
 
 
 def _normalize_series_values(
@@ -369,6 +418,29 @@ def _subplot_shape(count: int, *, ncols: int, nrows: int | None) -> tuple[int, i
     return nrows, ncols
 
 
+def _display_units(text: str) -> int:
+    """ラベルの表示幅の簡易推定。日本語などの全角文字は約2文字分。"""
+    from unicodedata import east_asian_width
+    return sum(2 if east_asian_width(ch) in ("F", "W") else 1 for ch in text)
+
+
+def _wrap_subplot_title(text: str, *, max_units: int) -> str:
+    """横並び時の長いサブプロット見出しを適度な位置で折り返す。"""
+    lines = []
+    current = ""
+    for char in str(text):
+        if char == "\n":
+            lines.append(current)
+            current = ""
+        elif current and _display_units(current + char) > max_units:
+            lines.append(current)
+            current = char
+        else:
+            current += char
+    lines.append(current)
+    return "<br>".join(lines)
+
+
 def build_interpolation_report_figure(
     interpolator,
     raw_data: pd.DataFrame,
@@ -379,24 +451,13 @@ def build_interpolation_report_figure(
     ncols: int = 1,
     nrows: int | None = None,
 ) -> go.Figure:
-    """生値と複数補間方式を、指定行数・列数のPlotlyレポートにする。
+    """生値と複数補間方式を任意グリッド配置したPlotly比較レポートにする。
 
-    Parameters
-    ----------
-    interpolator : ExcelInterpolator | Mapping[str, ExcelInterpolator]
-        単独補間器、または {"RegularGrid": grid, "RBF": rbf, ...}。
-        方式を複数指定すると生値マーカーは1回のみ表示し、各方式を異なる線種で重ねる。
-    raw_data : pandas.DataFrame
-        入力列と出力列を持つ元のExcelテーブル。
-    plot_specs : Sequence[InterpolationPlotSpec]
-        1つの設定が1つのサブプロットに対応する。
-    ncols : int, default 1
-        横方向のグラフ数。既定値は従来どおり1列。
-    nrows : int | None, default None
-        縦方向のグラフ数。Noneなら必要行数を自動計算する。
-        余った枠は空白のままにする。
-    show_range_slider : bool, default True
-        各グラフの横軸にレンジスライダーを表示する。
+    - 各グラフで横軸・系列列・固定列を独立指定できる（入力4次元以上も可）。
+    - 系列なしの場合は series_columns=[] とし、他入力をすべて fixed にする。
+    - 凡例は描画領域外の右側に配置し、長いときはPlotly標準スクロールを使う。
+    - 図幅・図高とサブプロット間隔はグラフ数から算出し、軸とレンジスライダー
+      に独立したスペースを確保する。小画面は縮小せず横スクロールで閲覧する。
     """
     specs = list(plot_specs)
     if not specs:
@@ -406,12 +467,26 @@ def build_interpolation_report_figure(
     first_model = next(iter(models.values()))
     is_comparison = len(models) > 1
 
-    titles = [spec.title for spec in specs] + [""] * (rows * cols - len(specs))
+    # 凡例が上部タイトルと重ならないよう、右側に専用の余白を設ける。
+    # 横軸のレンジスライダーと目盛り・軸名が次の行に重ならないよう高さを確保する。
+    figure_width = 310 + 585 * cols
+    row_height = 760 if show_range_slider else 550
+    figure_height = 135 + row_height * rows
+    # 行間のピクセル数を一定に近づけ、行数に応じて必要な高さを増やす。
+    gap_px = 275 if show_range_slider else 125
+    usable_height = figure_height - 115 - 85
+    vertical_spacing = (gap_px / usable_height) if rows > 1 else 0.0
+    horizontal_spacing = (85 / (585 * cols)) if cols > 1 else 0.0
+
+    titles = [
+        _wrap_subplot_title(spec.title, max_units=(44 if cols > 1 else 72))
+        for spec in specs
+    ] + [""] * (rows * cols - len(specs))
     fig = make_subplots(
         rows=rows, cols=cols, shared_xaxes=False,
         subplot_titles=titles,
-        vertical_spacing=(0.16 / (rows - 1) if rows > 1 else 0.0),
-        horizontal_spacing=(0.10 / (cols - 1) if cols > 1 else 0.0),
+        vertical_spacing=vertical_spacing,
+        horizontal_spacing=horizontal_spacing,
     )
     palette = qualitative.Plotly
     dashes = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
@@ -424,28 +499,26 @@ def build_interpolation_report_figure(
         col += 1
         if spec.y_column not in first_model.output_columns:
             raise ValueError(f"y_column={spec.y_column!r} は補間器の出力列にありません")
-        if spec.x_column not in first_model.input_columns:
-            raise ValueError(f"x_column={spec.x_column!r} は補間器の入力列にありません")
-        if spec.x_column in spec.fixed or spec.x_column in spec.series_columns:
-            raise ValueError("横軸列を fixed や series_columns に重複指定できません")
-        if set(spec.series_columns) & set(spec.fixed):
-            raise ValueError("series_columns と fixed の条件列が重複しています")
+        series_cols = _validate_plot_dimensions(spec, first_model.input_columns)
         for name, model in models.items():
             if spec.y_column not in model.output_columns:
                 raise ValueError(f"補間方式 {name!r} の出力列に {spec.y_column!r} がありません")
 
         fixed = _normalize_fixed(spec.fixed)
         series_cases = _normalize_series_values(
-            raw_data, series_columns=spec.series_columns,
+            raw_data, series_columns=series_cols,
             series_values=spec.series_values, fixed=fixed,
         )
         if not series_cases:
-            series_cases = [{}]
+            raise ValueError(
+                f"グラフ {spec.title!r}: 条件 {fixed} に一致する系列値がありません。"
+                f"series_values を明示するか、fixed の値を確認してください"
+            )
 
         for idx, series_case in enumerate(series_cases):
             color = palette[idx % len(palette)]
             conditions = {**fixed, **series_case}
-            series_label = _format_series_label(series_case, fallback=spec.y_column)
+            series_label = _format_series_label(series_case, fallback="系列なし")
             raw_slice = _filtered_raw_slice(
                 raw_data, x_column=spec.x_column, y_column=spec.y_column,
                 conditions=conditions,
@@ -497,22 +570,50 @@ def build_interpolation_report_figure(
                     ), row=row, col=col)
                     legend_seen.add(key)
 
-        fig.update_xaxes(title_text=spec.x_column, row=row, col=col)
-        fig.update_yaxes(title_text=spec.y_column, row=row, col=col)
+        # automarginはPlotlyに軸名・目盛り文字列を考慮した余白調整を依頼する。
+        fig.update_xaxes(
+            title_text=spec.x_column, title_standoff=18,
+            automargin=True, tickfont=dict(size=11),
+            row=row, col=col,
+        )
+        fig.update_yaxes(
+            title_text=spec.y_column, title_standoff=16,
+            automargin=True, tickfont=dict(size=11),
+            row=row, col=col,
+        )
         if show_range_slider:
-            fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.09), row=row, col=col)
+            fig.update_xaxes(
+                rangeslider=dict(visible=True, thickness=0.09),
+                row=row, col=col,
+            )
 
-    # 1グラフあたりの幅・高さを確保。スライダーは別の行に重ならないよう余白も使う。
+    # 日本語や長い補間方式名が凡例領域からはみ出さないよう右余白を拡張する。
+    longest_legend = max(
+        (_display_units(str(trace.name)) for trace in fig.data if trace.showlegend),
+        default=0,
+    )
+    legend_width = min(620, max(285, int(longest_legend * 7.2 + 85)))
+    figure_width = 585 * cols + 25 + legend_width
+
     fig.update_layout(
-        title=report_title,
+        title=dict(text=report_title or "", x=0.015, xanchor="left", y=0.987, yanchor="top"),
         template="plotly_white",
         hovermode="closest",
-        height=max(490 * rows, 510),
-        width=max(590 * cols, 850),
-        margin=dict(t=145, b=75, l=90, r=60),
-        legend=dict(orientation="h", yanchor="bottom", y=1.04,
-                    xanchor="left", x=0, groupclick="togglegroup"),
+        autosize=False,
+        height=figure_height,
+        width=figure_width,
+        margin=dict(t=115, b=85, l=95, r=legend_width),
+        legend=dict(
+            title=dict(text="系列 / 補間方式"),
+            orientation="v", yanchor="top", y=1.0,
+            xanchor="left", x=1.015,
+            groupclick="togglegroup",
+            font=dict(size=11),
+            tracegroupgap=4,
+        ),
     )
+    # Plotlyの独立した凡例は多数の系列があれば自動スクロール表示になる。
+    # HTMLのウィンドウ幅が狭い場合でもFigureを圧縮せず、横スクロールで閲覧する。
     return fig
 
 

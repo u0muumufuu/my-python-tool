@@ -6,7 +6,8 @@ Excel VBA:
 Excelを開かない実行:
     python src/run_interpolation_comparison.py --excel AircraftPerformance.xlsx
 
-編集する場所は下の REPORTS です。横並び個数 ncols と縦個数 nrows も指定できます。
+編集する場所は下の REPORTS です。ncols と nrows でグラフを配置します。
+3入力以上の設定例は examples/generate_multidimensional_comparison_demo.py を参照。
 """
 
 from __future__ import annotations
@@ -23,9 +24,25 @@ from utils.plotly_charts import InterpolationPlotSpec, export_interpolation_repo
 
 
 # ---------------------------------------------------------------------------
-# ユーザー設定。各グラフを複数方式で比較する。表示範囲Noneは実データの範囲。
-# 線色=系列値、線種=補間方式。Plotly.jsをHTML内に埋め込む。
+# ユーザー設定。下の REPORTS を編集してください。
+# 各グラフの x_column / series_columns / fixed は独立して指定できます。
+# 入力列数が3以上でも、x・系列・固定で全入力列を振り分ければ表示可能。
+# 系列なし → series_columns=[]、横軸以外の全入力列を fixed={...} に指定。
+# plots は InterpolationPlotSpec(...) でも普通の辞書 {...} でも指定できます。
+# HTMLは凡例を右側に配置し、行数から余白・高さを自動調整します。
 # ---------------------------------------------------------------------------
+# 例：入力4変数 CL(alpha, Mach, beta, de) の場合、plots を次のように指定できます。
+# （下記のコード断片は説明用で、既定のREPORTSには追加されません。）
+#   dict(title="CL vs alpha", x_column="alpha", y_column="CL",
+#        series_columns=["Mach"], series_values=[0.2, 0.4],
+#        fixed={"beta": 0.0, "de": 0.0})
+#   dict(title="CL vs alpha / no series", x_column="alpha", y_column="CL",
+#        series_columns=[], fixed={"Mach": 0.2, "beta": 0.0, "de": 0.0})
+#   dict(title="CL vs beta", x_column="beta", y_column="CL",
+#        series_columns=["de"], series_values=[-8.0, 0.0],
+#        fixed={"alpha": 2.0, "Mach": 0.4})
+# 各グラフで、横軸1列 + 系列0列以上 + 固定残り全列 = 全入力列、とします。
+# グラフ1枚ずつ上記設定を変更すれば、次元数に制限なく断面比較できます。
 REPORTS = [
     {
         "name": "aerodynamics",
@@ -151,13 +168,18 @@ def run(
                 workbook=workbook,
                 **options,
             )
+        # 辞書形式ならクラス生成は不要。3D以上の各グラフを独立設定できる。
+        plots = [
+            p if isinstance(p, InterpolationPlotSpec) else InterpolationPlotSpec(**p)
+            for p in config["plots"]
+        ]
         result = export_interpolation_report_html(
             models,
             raw,
-            plot_specs=list(config["plots"]),
+            plot_specs=plots,
             output_html=target / str(config["output_html"]),
             report_title=f"{name} — raw data vs interpolation methods",
-            show_range_slider=True,
+            show_range_slider=bool(config.get("show_range_slider", True)),
             ncols=int(config.get("ncols", 1)),
             nrows=(None if config.get("nrows") is None else int(config["nrows"])),
         )

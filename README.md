@@ -1,4 +1,4 @@
-# AircraftPerformance v15 — Excel補間・方程式ソルバー・Plotly比較
+# AircraftPerformance v16 — Excel補間・方程式ソルバー・Plotly比較
 
 この配布版は**補間モデルの構築、生データと複数補間方式の比較、方程式の求根**に特化しています。
 専用の飛行性能マップ計算・コンター等値線生成・Excelグラフ自動操作は含めていません。
@@ -9,7 +9,7 @@
 |---|---|
 | `src/run_interpolation_comparison.py` | Excel生データと各補間方式を比較する独立した実行・設定ファイル |
 | `src/utils/interpolation.py` | `ExcelInterpolator`：Excelデータの補間 |
-| `src/utils/plotly_charts.py` | `InterpolationPlotSpec`、比較Figureの生成、HTML出力、汎用XYプロット |
+| `src/utils/plotly_charts.py` | `InterpolationPlotSpec`、比較Figureの生成、HTML出力、汎用XYプロット。余白・凡例を自動調整 |
 | `src/utils/solvers.py` | `EquationSolver.solve()`／`solve_multiple_roots()` |
 | `src/utils/excel_io.py` | Excelへの数値・NaN出力を支援 |
 | `src/models/aerodynamics.py` | 空力DB補間ラッパー（CL/CD/Cm） |
@@ -68,7 +68,7 @@ python src/run_interpolation_comparison.py --excel AircraftPerformance.xlsx
 'nrows': 2,       # 縦方向のグラフ数。Noneなら必要行数を自動計算
 ```
 
-グラフ1枚の仕様：
+グラフ1枚の仕様（3入力以上でも同様に設定可能）：
 
 ```python
 from utils.plotly_charts import InterpolationPlotSpec
@@ -83,6 +83,14 @@ InterpolationPlotSpec(
 保存形式はオフラインで閲覧できる単体HTMLです（Plotly.jsを埋込）。
 色で系列、線種で補間方式を識別し、生データはマーカーで表示します。
 横軸レンジスライダー、ホバー、表示系列切替が利用できます。
+**v16の改善：** 凡例をグラフの右側に分離し、軸・タイトル・レンジスライダー間の余白を自動調整します。
+入力が3変数以上の場合も、各グラフで横軸・系列・固定する列を独立して選べます。例えば
+`input_columns=["alpha", "Mach", "beta", "de"]` なら、
+`x_column="alpha", series_columns=["Mach"], fixed={"beta":0, "de":0}` と指定します。
+**系列なし**なら `series_columns=[]`、`fixed={"Mach":0.2, "beta":0, "de":0}` とします。
+4入力の複数パターンは `docs/INTERPOLATION_COMPARISON.md` 第3～4節とサンプルを参照。
+`plots` は `InterpolationPlotSpec(...)` のほか、通常の辞書形式 `{...}` でも指定できます。
+レポート設定 `show_range_slider=False` でスライダーを非表示にできます。
 
 実行後の返り値は `{レポート名: pathlib.Path}` の辞書です。
 
@@ -133,6 +141,8 @@ print(one.x, [r.x for r in roots])
 ## 7. サンプルとテスト
 
 - `examples/generate_interpolation_comparison_demo.py`：架空データから比較HTMLを生成
+- `examples/generate_multidimensional_comparison_demo.py`：4入力変数の系列あり／なしの比較HTMLを生成
+- `examples/multidimensional_comparison_demo.html`、`.xlsx`：4入力の結果入りサンプル
 - `examples/interpolation_comparison_demo.html`：ブラウザ閲覧用のサンプル
 - `examples/multiple_roots_demo.py`：単一・連立方程式の複数解探索
 - `tests/`：補間、求根、Excel模擬入出力、Plotly比較のテスト
