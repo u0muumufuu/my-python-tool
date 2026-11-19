@@ -4,6 +4,8 @@
 - 単一方程式、探索区間なし: scipy.optimize.root
 - 連立方程式 (n 本・n 未知数): scipy.optimize.root
 - 複数解探索: solve_multiple_roots (1変数の区間走査、または多点初期値)
+- 方程式 func: 1つの関数、または関数のリスト/タプルから指定可能
+- オプションの不等式制約: 求根成功後に c_i(x) >= -constraint_tol を検査
 
 数値的な計算不能（初期値・探索区間・残差の NaN/±Inf）と未収束は
 ``converged=False, x=np.nan`` として返す（連立では全成分 NaN）。
@@ -14,11 +16,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from collections.abc import Sequence
 from typing import Any, Callable, Mapping
 
 import numpy as np
 from scipy.optimize import brentq, root
 from scipy.stats import qmc
+
+
+EquationFunctions = Callable[..., Any] | Sequence[Callable[..., Any]]
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,7 @@ class EquationResult:
     residual は最後の残差（評価不能成分は NaN）。
     last_x は最後に評価を試みた有限の推定値。初期値自体が無効なら None。
     initial_x / search_bracket は solve_multiple_roots で発見した解の探索元。
+    constraint_values は制約が評価された場合の c_i(x) の値（制約なしは None）。
     """
 
     x: float | np.ndarray
@@ -41,6 +48,7 @@ class EquationResult:
     last_x: float | np.ndarray | None = None
     initial_x: float | np.ndarray | None = None
     search_bracket: tuple[float, float] | None = None
+    constraint_values: tuple[float, ...] | None = None
 
     @property
     def residual_norm(self) -> float:
@@ -128,6 +136,62 @@ class EquationSolver:
         self.root_options = dict(root_options or {})
 
     @staticmethod
+    def _normalize_equations(func: EquationFunctions) -> Callable[..., Any]:
+        """単一関数または関数の列を、従来の残差関数に正規化する。
+
+        func=equations / func=lambda x: [f(x), g(x)] は変更せず使用する。
+        func=[f, g] / func=(f, g) などの場合は、各関数のスカラー
+        または1次元残差を順番に連結して1つの残差にする。
+        """
+        if callable(func):
+            return func
+        if isinstance(func, (str, bytes)) or not isinstance(func, Sequence):
+            raise TypeError(
+                "func は関数、または関数のリスト/タプルで指定してください。"
+            )
+        equations = tuple(func)
+        if not equations:
+            raise ValueError("func の関数リストは空にできません。")
+        if any(not callable(equation) for equation in equations):
+            raise TypeError("func の各要素は callable である必要があります。")
+
+        def combined(x: float | np.ndarray, *args: Any) -> float | np.ndarray:
+            residuals: list[float] = []
+            for index, equation in enumerate(equations):
+                # 他の式の評価に影響しないよう、連立では入力を個別にコピーする。
+                local_x = (
+                    float(x) if np.ndim(x) == 0
+                    else np.asarray(x, dtype=float).copy()
+                )
+                raw = equation(local_x, *args)
+                if raw is None:
+                    raise ValueError(f"func[{index}] は None を返せません。")
+                try:
+                    values = np.asarray(raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"func[{index}] は数値スカラーか空でない1次元配列を返してください。"
+                    ) from exc
+                if values.ndim > 1 or values.size == 0 or values.dtype.kind == "b":
+                    raise ValueError(
+                        f"func[{index}] は数値スカラーか空でない1次元配列を返してください"
+                        "（真偽値、空配列、2次元以上は不可）。"
+                    )
+                if isinstance(raw, (list, tuple)) and any(
+                    isinstance(item, (bool, np.bool_)) for item in raw
+                ):
+                    raise ValueError(f"func[{index}] に真偽値は指定できません。")
+                try:
+                    residuals.extend(np.asarray(raw, dtype=float).reshape(-1).tolist())
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(
+                        f"func[{index}] は数値スカラーか空でない1次元配列を返してください。"
+                    ) from exc
+            return residuals[0] if len(residuals) == 1 else np.asarray(residuals)
+
+        return combined
+
+    @staticmethod
     def _scalar_output(func: Callable[..., Any], x: float, args: tuple[Any, ...]) -> float:
         values = np.asarray(func(float(x), *args), dtype=float)
         if values.ndim != 0:
@@ -183,6 +247,104 @@ class EquationSolver:
         if not result.converged and raise_on_failure:
             raise ConvergenceError(result)
         return result
+
+    @staticmethod
+    def _validate_constraints(
+        constraints: Callable[..., Any] | Sequence[Callable[..., Any]] | None,
+        constraint_tol: float,
+    ) -> tuple[tuple[Callable[..., Any], ...], float]:
+        """制約の指定形式を検査する。未指定/空配列は従来動作を保つ。"""
+        if isinstance(constraint_tol, (bool, np.bool_)):
+            raise ValueError("constraint_tol は0以上の有限数を指定してください。")
+        try:
+            tolerance = float(constraint_tol)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError("constraint_tol は0以上の有限数を指定してください。") from exc
+        if not np.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("constraint_tol は0以上の有限数を指定してください。")
+        if constraints is None:
+            return (), tolerance
+        # 単一の関数は 1要素の関数リストとして扱う。
+        # どの関数も数値スカラー、または1次元の制約値配列を返せる。
+        if callable(constraints):
+            return (constraints,), tolerance
+        if isinstance(constraints, (str, bytes)) or not isinstance(constraints, Sequence):
+            raise TypeError(
+                "constraints は関数、関数のリスト/タプル、または None で指定してください。"
+            )
+        predicates = tuple(constraints)
+        if any(not callable(item) for item in predicates):
+            raise TypeError("constraints の各要素は callable である必要があります。")
+        return predicates, tolerance
+
+    @staticmethod
+    def _apply_constraints(
+        result: EquationResult,
+        constraints: tuple[Callable[..., Any], ...],
+        constraint_tol: float,
+    ) -> EquationResult:
+        """成功した解に不等式を事後適用する（反復途中は制限しない）。
+
+        constraints は単一の関数または関数の列で、各関数はスカラーか
+        空でない1次元の数値列を返す。すべての制約値を平坦化した順序で
+        constraint_values に保存し、c_i(x) >= -constraint_tol を判定する。
+        """
+        if not constraints or not result.converged:
+            return result
+
+        solution = result.x
+        values: list[float] = []
+        violations: list[str] = []
+        for callback_index, predicate in enumerate(constraints):
+            # ユーザー関数の破壊的変更が後続の制約や求根結果に影響しないようにする。
+            x = float(solution) if np.ndim(solution) == 0 else np.asarray(solution, dtype=float).copy()
+            raw = predicate(x)
+            if raw is None:
+                raise ValueError(f"constraints[{callback_index}] は None を返せません。")
+            try:
+                as_array = np.asarray(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"constraints[{callback_index}] は数値スカラーか空でない1次元配列を返してください。"
+                ) from exc
+            if as_array.ndim > 1 or as_array.size == 0 or as_array.dtype.kind == "b":
+                raise ValueError(
+                    f"constraints[{callback_index}] は数値スカラーか空でない1次元配列を返してください"
+                    "（真偽値、空配列、2次元以上は不可）。"
+                )
+            # [True, 1.0] がNumPyの型変換で [1.,1.] となるのを防ぐ。
+            if isinstance(raw, (tuple, list)) and any(
+                isinstance(value, (bool, np.bool_)) for value in raw
+            ):
+                raise ValueError(f"constraints[{callback_index}] に真偽値は指定できません。")
+            try:
+                numeric = np.asarray(raw, dtype=float).reshape(-1)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"constraints[{callback_index}] は数値スカラーか空でない1次元配列を返してください。"
+                ) from exc
+            for value in numeric:
+                number = float(value)
+                values.append(number)
+                index = len(values)
+                if not np.isfinite(number):
+                    violations.append(f"制約{index}=NaN/Inf")
+                elif number < -constraint_tol:
+                    violations.append(f"制約{index}={number:.9g} < {-constraint_tol:.9g}")
+
+        if not violations:
+            return replace(result, constraint_values=tuple(values))
+
+        n = 1 if np.ndim(solution) == 0 else len(solution)
+        last_x = float(solution) if n == 1 else np.asarray(solution, dtype=float).copy()
+        return replace(
+            result,
+            x=float("nan") if n == 1 else np.full(n, np.nan),
+            converged=False,
+            message="方程式には収束しましたが、不等式制約に違反しました: " + "; ".join(violations),
+            last_x=last_x,
+            constraint_values=tuple(values),
+        )
 
     @staticmethod
     def _multi_bounds(bounds: Any) -> np.ndarray:
@@ -243,7 +405,7 @@ class EquationSolver:
 
     def solve_multiple_roots(
         self,
-        func: Callable[..., Any],
+        func: EquationFunctions,
         bounds: Any,
         *,
         method: str = "auto",
@@ -253,14 +415,19 @@ class EquationSolver:
         unique_tol: float | list[float] | np.ndarray = 1e-6,
         args: tuple[Any, ...] = (),
         seed: int | None = 0,
+        constraints: Callable[..., Any] | Sequence[Callable[..., Any]] | None = None,
+        constraint_tol: float = 1e-6,
     ) -> list[EquationResult]:
         """指定した探索範囲から、重複しない複数の求根候補を探索する。
 
         Parameters
         ----------
-        func : callable
-            1変数では ``func(x, *args) -> float``、n変数では
-            ``func(x, *args) -> 長さnの1次元配列``。
+        func : callable | sequence[callable]
+            1つの関数 ``func(x, *args) -> 数値スカラー/長さnの1次元配列``、
+            または ``func=[f, g]`` / ``func=(f, g)`` を指定可能。
+            後者では各関数がスカラーまたは1次元配列を返せる。
+            各関数の残差を順番に連結した総数が未知数nと一致する必要がある。
+            1変数の場合 x は float、連立では shape(n,) の ndarray。
         bounds : sequence[(float, float)]
             変数の順に並べた探索範囲。1変数のみ ``(low, high)`` も可。
             ``root`` の反復中の制約ではなく、初期値生成・最終解判定に使用。
@@ -279,6 +446,15 @@ class EquationSolver:
             方程式に追加する引数。
         seed : int | None
             Sobol/乱数の生成 seed。デフォルトは再現性のため 0。
+        constraints : callable | sequence[callable] | None, default None
+            単一関数 ``constraints(x) -> [c1, c2, ...]`` や
+            ``constraints=[lambda x: c1, lambda x: c2]`` の両方に対応。
+            関数ごとにスカラー/1次元数値列を返せる。省略/None/[]は制約なし。
+            各 c(x) >= -constraint_tol なら許容する。
+            1変数では x は float、連立では shape(n,) の ndarray。
+            ``args`` は方程式 func にのみ渡り、制約は求根後に評価する。
+        constraint_tol : float, default 1e-6
+            制約の小さな負値を許容する絶対誤差（各制約式の単位）。
 
         Returns
         -------
@@ -295,13 +471,17 @@ class EquationSolver:
           接するだけの解や、狭い区間内の偶数個の解を見逃す場合がある。
         - root は複数初期値から solve を繰り返す。範囲外に収束した解は除外。
           root 内部で NaN が生じた試行は、その試行だけ破棄する。
+        - 制約がある場合、発見した解のうち制約に適合するものだけを返す。
+          収束処理自体は制約しないため、制約域内の別解の発見は保証しない。
         - プログラムの指定ミス・残差ベクトルの次元不一致・例外は隠蔽しない。
         - 各解の function_calls は探索全体ではなく、その解の求根実行に対応。
         """
-        if not callable(func):
-            raise TypeError("func には呼び出し可能な関数を指定してください。")
+        func = self._normalize_equations(func)
         if not isinstance(args, tuple):
             raise TypeError("args はタプルで指定してください。")
+        constraint_functions, constraint_tol = self._validate_constraints(
+            constraints, constraint_tol
+        )
         if not isinstance(method, str) or method not in ("auto", "brentq", "root"):
             raise ValueError("method は 'auto', 'brentq', 'root' から指定してください。")
         if not isinstance(initial_strategy, str) or initial_strategy not in (
@@ -353,7 +533,9 @@ class EquationSolver:
                         method="brentq", message="走査格子点で残差が厳密に0です。",
                         function_calls=1, iterations=0,
                     )
-                    self._unique_multi_root(found, direct, limits)
+                    direct = self._apply_constraints(direct, constraint_functions, constraint_tol)
+                    if direct.converged:
+                        self._unique_multi_root(found, direct, limits)
                 if i + 1 >= len(grid):
                     continue
                 next_y = sampled[i + 1]
@@ -361,7 +543,10 @@ class EquationSolver:
                     continue
                 if (y < 0 < next_y) or (next_y < 0 < y):
                     bracket = (float(x), float(grid[i + 1]))
-                    candidate = self.solve(func, bracket=bracket, args=args)
+                    candidate = self.solve(
+                        func, bracket=bracket, args=args,
+                        constraints=constraint_functions, constraint_tol=constraint_tol,
+                    )
                     if candidate.converged:
                         candidate = replace(candidate, search_bracket=bracket)
                         self._unique_multi_root(found, candidate, limits)
@@ -372,7 +557,10 @@ class EquationSolver:
             )
             for start in starts:
                 start_x = float(start[0]) if n == 1 else start.copy()
-                candidate = self.solve(func, x0=start_x, args=args)
+                candidate = self.solve(
+                    func, x0=start_x, args=args,
+                    constraints=constraint_functions, constraint_tol=constraint_tol,
+                )
                 if not candidate.converged:
                     continue
                 x = np.atleast_1d(np.asarray(candidate.x, dtype=float))
@@ -391,25 +579,38 @@ class EquationSolver:
 
     def solve(
         self,
-        func: Callable[..., Any],
+        func: EquationFunctions,
         *,
         x0: float | list[float] | np.ndarray | None = None,
         bracket: tuple[float, float] | None = None,
         args: tuple[Any, ...] = (),
         raise_on_failure: bool = False,
+        constraints: Callable[..., Any] | Sequence[Callable[..., Any]] | None = None,
+        constraint_tol: float = 1e-6,
     ) -> EquationResult:
         """方程式を求解し、数値的な失敗は NaN の結果として返す。
 
         - ``bracket=(lower, upper)``: 単一変数の brentq。
         - ``x0=...``: root。x0 が配列の場合は連立方程式。
+        - ``func=equations`` か ``func=[f, g]`` / ``func=[lambda x: ..., ...]``。
+          関数リストの各関数はスカラーまたは1次元残差列を返せる。
+          ``args`` はリスト内のすべての関数に共通して渡される。
         - NaN/±Inf の x0・bracket・残差は未収束として返す。
         - 不正な形状、指定不足、両方式の同時指定は例外。
         - ``raise_on_failure=True`` のときは失敗時に ConvergenceError。
+        - ``constraints=関数``（数値1個または1次元配列を返す）または
+          ``constraints=[lambda x: ..., lambda x: ...]`` は省略可能な事後判定。
+          ``c(x) >= -constraint_tol`` を満たさない解は、残差・発見した解の
+          位置を保管したまま ``converged=False, x=NaN`` とする。
+          反復中の x は制約しない。1変数の x は float、連立では ndarray。
+        - 制約関数が NaN/Inf を返す場合は不適合。形式ミスは例外。
         """
-        if not callable(func):
-            raise TypeError("func には呼び出し可能な関数を指定してください。")
+        func = self._normalize_equations(func)
         if not isinstance(args, tuple):
             raise TypeError("args はタプルで指定してください。")
+        constraint_functions, constraint_tol = self._validate_constraints(
+            constraints, constraint_tol
+        )
 
         if bracket is not None:
             if x0 is not None:
@@ -472,7 +673,10 @@ class EquationSolver:
                     residual=bad.residual, function_calls=calls,
                     iterations=None, last_x=bad.x,
                 )
-            return self._finish(result, raise_on_failure)
+            return self._finish(
+                self._apply_constraints(result, constraint_functions, constraint_tol),
+                raise_on_failure,
+            )
 
         if x0 is None:
             raise ValueError("探索区間がない場合は初期値 x0 が必要です。")
@@ -542,4 +746,7 @@ class EquationSolver:
                 residual=bad.residual, function_calls=calls,
                 iterations=None, last_x=bad.x,
             )
-        return self._finish(result, raise_on_failure)
+        return self._finish(
+            self._apply_constraints(result, constraint_functions, constraint_tol),
+            raise_on_failure,
+        )
