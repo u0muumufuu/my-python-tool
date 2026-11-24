@@ -1,0 +1,1148 @@
+======================================================================
+solvers.py 使用方法ガイド（AircraftPerformance v19 対応）
+======================================================================
+対象：AircraftPerformance/src/utils/solvers.py（v19）
+目的：単一解・複数解、1元・多元連立方程式、関数の指定方法、制約式、
+      数値設定、結果の読み取り、失敗時の対応を説明する。
+
+このガイドのコード例は v19 の実装に合わせて記載している。
+「方程式の制約」は解を見つけた後に採用・棄却する処理であり、
+SciPy の求根反復自体を制約領域内に閉じ込める機能ではない。
+
+目次
+  1. 何を解くプログラムか／用語
+  2. インポートとソルバーの初期設定
+  3. 使い分け早見表
+  4. func の書き方：単一関数・関数リスト・lambda
+  5. solve()：単一解の求め方
+  6. solve_multiple_roots()：複数解の求め方
+  7. bounds・bracket・x0 の違い
+  8. 複数解探索の設定（method / n_starts / scan_points 等）
+  9. constraints：不等式制約の全指定形式
+ 10. args：方程式に追加する固定パラメータ
+ 11. EquationResult：返り値の全項目
+ 12. エラー・NaN・未収束の扱い
+ 13. 航空機トリム計算の例
+ 14. 実務上の注意とチェックリスト
+ 15. 短いコピー用レシピ
+ 16. ソースコード上の根拠
+
+
+======================================================================
+1. 何を解くプログラムか／用語
+======================================================================
+
+solvers.py は、非線形方程式の「残差がゼロになる変数」を求める。
+
+1元方程式：
+    f(x) = 0
+    未知数 x が1個、方程式の残差も1個。
+
+n元連立方程式：
+    f1(x1, ..., xn) = 0
+    f2(x1, ..., xn) = 0
+             ...
+    fn(x1, ..., xn) = 0
+    未知数が n 個、残差の総数も n 個。
+
+具体例：
+    f(x) = x**2 - 4             → x = -2 または 2
+    f1(x) = x[0]**2 - 1
+    f2(x) = x[1]**2 - 4          → 4つの組合せの解がある
+
+「単一解」：1つの初期値、または1つの区間から、1回の求根を行う。
+「複数解」：探索領域を設定し、複数の初期値・区間を走査して
+            異なる解を複数見つけようとする。
+
+重要：solve_multiple_roots() でも、数学的な全解を必ず見つけられる
+      わけではない。初期値や走査密度の影響を受ける。
+
+
+======================================================================
+2. インポートとソルバーの初期設定
+======================================================================
+
+2.1 インポート
+
+    import numpy as np
+    from utils.solvers import EquationSolver, EquationResult, ConvergenceError
+
+通常は src フォルダを Python のインポートパスに含めて実行する。
+例：プロジェクトの src/ 内から実行する場合は上記の import を利用。
+
+2.2 ソルバー作成（すべて省略可能な初期設定）
+
+    solver = EquationSolver(
+        root_method="hybr",
+        tol=1e-10,
+        residual_tol=1e-8,
+        maxiter=100,
+        root_options=None,
+    )
+
+引数             既定値       意味
+---------------------------------------------------------------------
+root_method      "hybr"       scipy.optimize.root に渡す計算法。
+                              （例："hybr"）
+tol              1e-10        SciPy側の収束許容値。
+                              brentq では xtol に渡す。
+residual_tol     1e-8         返す解の最大絶対残差の許容値。
+                              |f_i(x)| がすべてこれ以下か確認。
+maxiter          100          brentq の最大反復回数。
+                              root の反復制御は root_options で設定。
+root_options     None         scipy.optimize.root 用の辞書。
+
+例：hybr 法での関数評価回数の上限を変更するとき
+
+    solver = EquationSolver(
+        root_method="hybr",
+        root_options={"maxfev": 1000},
+    )
+
+root_options に使用できる項目は root_method に依存する。
+
+【tol と residual_tol の違い】
+- tol：SciPy に渡す、求根アルゴリズムの収束判定に関する数値。
+- residual_tol：この solvers.py が「十分に方程式を満たす」と
+                最終判断する最大絶対残差の上限。
+- tol が小さいからといって、必ず残差が小さくなるわけではない。
+- 方程式ごとの残差の単位・スケールが異なる場合は、残差の正規化も検討。
+
+
+======================================================================
+3. 使い分け早見表
+======================================================================
+
+目的                           呼び出し                    主要な入力
+---------------------------------------------------------------------
+1元方程式の1解（区間指定）      solve()                    bracket=(a,b)
+1元方程式の1解（初期値指定）    solve()                    x0=数値
+n元連立方程式の1解             solve()                    x0=[x1,...,xn]
+1元方程式の複数解              solve_multiple_roots()     bounds=[(a,b)]
+n元連立方程式の複数解           solve_multiple_roots()     bounds=[...n組...]
+求まった解に制約を適用         両方                       constraints=...
+方程式に固定条件を渡す         両方                       args=(...)
+
+solve() は EquationResult を1個返す。
+solve_multiple_roots() は list[EquationResult] を返す。
+
+
+======================================================================
+4. func の書き方：単一関数・関数リスト・lambda
+======================================================================
+
+func には「方程式の左辺（残差）」を指定する。
+計算する値は必ず「=0 にしたい式」であること。
+
+4.1 1元方程式：def で定義
+
+    def f(x):
+        return x**2 - 4
+
+    result = solver.solve(func=f, bracket=(0, 3))
+
+1元では、func に渡される x は float（単一の数値）。
+返り値も数値スカラー1個とする。
+
+4.2 1元方程式：lambda で定義
+
+    result = solver.solve(
+        func=lambda x: x**2 - 4,
+        x0=1.0,
+    )
+
+4.3 2元連立方程式：1つの関数で残差をまとめる
+
+    def equations(x):
+        x1, x2 = x
+        return [
+            x1**2 - 1,
+            x2**2 - 4,
+        ]
+
+    result = solver.solve(
+        func=equations,
+        x0=[0.8, 1.9],
+    )
+
+多元連立では、x は shape=(n,) の NumPy配列。
+func は長さ n の1次元残差列を返す（例：リスト、タプル、ndarray）。
+
+4.4 2元連立方程式：複数の関数をリストで直接指定（v19対応）
+
+    def f(x):
+        return x[0]**2 - 1
+
+    def g(x):
+        return x[1]**2 - 4
+
+    result = solver.solve(
+        func=[f, g],
+        x0=[0.8, 1.9],
+    )
+
+    # タプルでもよい：func=(f, g)
+
+4.5 lambda式のリストでもよい
+
+    result = solver.solve(
+        func=[
+            lambda x: x[0]**2 - 1,
+            lambda x: x[1]**2 - 4,
+        ],
+        x0=[0.8, 1.9],
+    )
+
+4.6 通常関数と lambda を混在させてもよい
+
+    result = solver.solve(
+        func=[f, lambda x: x[1]**2 - 4],
+        x0=[0.8, 1.9],
+    )
+
+4.7 各関数が複数の残差を返す書き方も可
+
+    def first_two(x):
+        return [x[0] + x[1] - 3, x[1] - x[2] - 1]
+
+    def third(x):
+        return x[0] - x[2] - 1
+
+    result = solver.solve(
+        func=[first_two, third],
+        x0=[1.0, 1.0, 1.0],
+    )
+
+この場合、first_two の2本と third の1本を連結して、
+未知数3個に対する合計3本の残差として評価する。
+
+4.8 func 指定のルール
+
+    func=equations                 OK：関数が残差ベクトルを返す
+    func=lambda x: [...]          OK：lambda が残差ベクトルを返す
+    func=[f, g]                   OK：関数のリスト
+    func=(f, g)                   OK：関数のタプル
+    func=[lambda x: ..., ...]     OK：lambda のリスト
+    func=[f, lambda x: ...]       OK：混在
+    func=None                     NG：必須
+    func=[]                       NG：方程式が0個
+    func=[f, 123]                 NG：各要素は関数であること
+
+【非常に重要】
+- 残差の総数は、未知数の数と一致する必要がある。
+- 単一方程式の場合、返り値はスカラー1個。
+- 複数方程式の場合、返り値は長さ n の1次元数値列。
+- 関数リストの各関数は、スカラーまたは空でない1次元数値列を返す。
+- None、真偽値、空配列、2次元以上の配列は指定しない。
+- 変数 x の順番は、方程式、x0、bounds で統一する。
+- 引数で指定した func に渡す値は「元の未知数」そのもの。
+  例えば x=[alpha, delta_e] なら x[0]=alpha, x[1]=delta_e。
+
+
+======================================================================
+5. solve()：単一解の求め方
+======================================================================
+
+5.1 関数の形式（v19）
+
+    result = solver.solve(
+        func,
+        *,
+        x0=None,
+        bracket=None,
+        args=(),
+        raise_on_failure=False,
+        constraints=None,
+        constraint_tol=1e-6,
+    )
+
+注：上は引数一覧の説明用表記。Python 呼び出しでは「*」は書かない。
+    func 以外はキーワード指定する。
+
+引数                必須か       内容
+---------------------------------------------------------------------
+func                必須         求解する1本／複数本の方程式
+x0                  条件付き     root の初期値（スカラーまたは1次元列）
+bracket             条件付き     brentq の区間 (下限, 上限)
+args                任意         方程式へ渡す固定パラメータのタプル
+raise_on_failure    任意         True なら数値的失敗時に例外
+constraints         任意         解の事後判定用の不等式制約
+constraint_tol      任意         制約許容差（0以上、既定 1e-6）
+
+x0 と bracket のどちらか一方を指定する。
+同時指定はエラー。
+
+5.2 1元方程式：区間を指定して brentq
+
+    result = solver.solve(
+        func=lambda x: x**2 - 4,
+        bracket=(0.0, 3.0),
+    )
+    print(result.x)        # 約2.0
+    print(result.converged) # True
+
+bracket=(a,b) の基本条件：a < b。
+端点の残差が異符号、またはどちらかの端点の残差が厳密に0である
+必要がある。同符号の場合、未収束結果を返す。
+
+5.3 1元方程式：初期値を指定して root
+
+    result = solver.solve(
+        func=lambda x: x**2 - 4,
+        x0=1.0,
+    )
+    print(result.x)  # 約2.0
+
+1元でも x0 を指定すると scipy.optimize.root を使用する。
+x0=1.0 でも x0=[1.0] でも、未知数1個として扱い、
+関数側に渡される x は float。
+
+5.4 2元連立方程式：初期値を指定して root
+
+    def f(x):
+        return x[0] + x[1] - 3
+
+    def g(x):
+        return x[0] - x[1] - 1
+
+    result = solver.solve(
+        func=[f, g],
+        x0=[0.0, 0.0],
+    )
+    print(result.x)  # 約 [2.0, 1.0]
+
+多変数の solve() で bracket は使えない。
+多変数では x0=[x1, x2, ...] を指定する。
+
+5.5 3元以上も同じ
+
+    def eqs(x):
+        x1, x2, x3 = x
+        return [
+            x1 + x2 + x3 - 6,
+            x1 - x2,
+            x2 - x3,
+        ]
+
+    result = solver.solve(
+        func=eqs,
+        x0=[1.0, 2.0, 3.0],
+    )
+    # 解は [2.0, 2.0, 2.0]
+
+5.6 制約付きの単一解
+
+    result = solver.solve(
+        func=lambda x: x**2 - 4,
+        bracket=(0.0, 3.0),
+        constraints=lambda x: 1.5 - x,  # x <= 1.5
+    )
+
+方程式としては x=2 に収束するが、制約違反となるので：
+    result.converged       False
+    result.x               nan
+    result.last_x          約2.0（棄却した収束解）
+    result.constraint_values  約(-0.5,)
+
+5.7 数値的な失敗を例外で処理したい場合
+
+    try:
+        result = solver.solve(
+            func=lambda x: x**2 - 4,
+            bracket=(3.0, 4.0),  # この区間には根を挟まない
+            raise_on_failure=True,
+        )
+    except ConvergenceError as exc:
+        print(exc.result.message)
+
+raise_on_failure=True は solve() の引数。
+solve_multiple_roots() にはない。
+
+
+======================================================================
+6. solve_multiple_roots()：複数解の求め方
+======================================================================
+
+6.1 関数の形式（v19）
+
+    results = solver.solve_multiple_roots(
+        func,
+        bounds,
+        *,
+        method="auto",
+        scan_points=100,
+        n_starts=100,
+        initial_strategy="sobol",
+        unique_tol=1e-6,
+        args=(),
+        seed=0,
+        constraints=None,
+        constraint_tol=1e-6,
+    )
+
+注：上は引数一覧の説明用表記。Python 呼び出しでは「*」は書かない。
+
+6.2 1元方程式の複数解
+
+    # (x-1)(x-3)(x-5) = 0
+    results = solver.solve_multiple_roots(
+        func=lambda x: (x - 1)*(x - 3)*(x - 5),
+        bounds=[(0.0, 6.0)],
+        method="brentq",
+        scan_points=120,
+    )
+
+    print([r.x for r in results])
+    # [1.0, 3.0, 5.0]（計算精度による微小差はあり得る）
+
+1元の bounds は (0.0, 6.0) だけでもよい。
+method="auto" の場合、1元では brentq が選ばれる。
+
+6.3 2元連立方程式の複数解
+
+    def f(x):
+        return x[0]**2 - 1
+
+    def g(x):
+        return x[1]**2 - 4
+
+    results = solver.solve_multiple_roots(
+        func=[f, g],
+        bounds=[
+            (-2.0, 2.0),  # x[0]
+            (-3.0, 3.0),  # x[1]
+        ],
+        method="root",
+        n_starts=200,
+        initial_strategy="sobol",
+        unique_tol=1e-6,
+        seed=0,
+    )
+
+    for r in results:
+        print(r.x, r.residual_norm)
+
+    # 期待される4つの解（探索結果はアルゴリズムに依存）：
+    # [-1,-2], [-1,2], [1,-2], [1,2]
+
+6.4 lambda式リストでもよい
+
+    results = solver.solve_multiple_roots(
+        func=[
+            lambda x: x[0]**2 - 1,
+            lambda x: x[1]**2 - 4,
+        ],
+        bounds=[(-2.0, 2.0), (-3.0, 3.0)],
+        n_starts=200,
+    )
+
+6.5 3元以上の場合
+
+    def eqs(x):
+        return [
+            x[0]**2 - 1,
+            x[1] - x[0],
+            x[2] + x[0],
+        ]
+
+    results = solver.solve_multiple_roots(
+        func=eqs,
+        bounds=[(-2, 2), (-2, 2), (-2, 2)],
+        method="root",
+        n_starts=200,
+    )
+
+6.6 得られた解を取り出す
+
+    if not results:
+        print("今回の探索条件では、有効な解を発見できませんでした")
+    else:
+        for i, r in enumerate(results, start=1):
+            print("解", i, "=", r.x)
+            print("残差=", r.residual)
+            print("最大絶対残差=", r.residual_norm)
+            print("初期値=", r.initial_x)
+            print("探索区間=", r.search_bracket)
+
+結果は有効な解のみのリスト。解の数が0なら空リスト []。
+返す順序は1元なら値の昇順、多元なら x の辞書順。
+
+【注意】
+- root は指定した n_starts 回分の初期値から探索を試みる。
+- 最終解が bounds から外れた場合は返さない。
+- 求根途中の試行点は bounds の外に出る可能性がある。
+- 探索に失敗した試行や制約違反の解は結果リストに含まれない。
+
+
+======================================================================
+7. bounds・bracket・x0 の違い
+======================================================================
+
+名前         使用するメソッド             目的
+---------------------------------------------------------------------
+x0           solve()                      1回の求根の初期推定値
+bracket      solve()                      1元 brentq の根を挟む区間
+bounds       solve_multiple_roots()       複数解の初期値生成範囲・
+                                          発見した解の最終範囲判定
+
+例：
+
+    # 1回の求根：初期値
+    solver.solve(func=equations, x0=[2.0, -1.0])
+
+    # 1元の1解：区間
+    solver.solve(func=lambda x: x**2-4, bracket=(0, 3))
+
+    # 2元の複数解：探索範囲
+    solver.solve_multiple_roots(
+        func=equations,
+        bounds=[(-5, 5), (-10, 10)],
+    )
+
+bounds の順序は x[0], x[1], ..., x[n-1] と同じ。
+例えば x=[alpha, delta_e] なら：
+
+    bounds=[
+        (-5, 20),   # 迎角 alpha [deg]
+        (-25, 25),  # 昇降舵角 delta_e [deg]
+    ]
+
+すべての上下限は有限数で、下限 < 上限。
+NaN/Inf の bounds は、solve_multiple_roots() では [] を返す。
+下限 >= 上限は ValueError。
+
+bounds は「反復中に絶対に超えない壁」ではないことに注意。
+
+
+======================================================================
+8. 複数解探索の設定
+======================================================================
+
+8.1 method
+
+    method="auto"    # 既定。1元→brentq、多元→root
+    method="brentq"  # 1元限定。符号変化を利用した区間探索
+    method="root"    # 1元または多元。初期値を多数生成して求根
+
+通常の連立方程式なら method="auto" か method="root" を使用。
+
+8.2 scan_points（brentq で使用）
+
+    scan_points=100
+
+探索範囲を100区間に分割し、101個の格子点の残差を評価。
+隣接する有限な残差に符号変化があれば brentq を実行。
+残差が格子点で厳密に0なら、その点も根として採用候補となる。
+
+注意：接するだけで符号が変わらない偶数重根や、
+      1区間内に複数の根があって符号変化が消える場合は見逃し得る。
+      必要なら scan_points を増やす。
+
+8.3 n_starts（root で使用）
+
+    n_starts=100
+    n_starts=300
+
+何個の初期値を作り、その値から求根を試みるか。
+増やすと解を発見する可能性が高まる場合があるが、計算時間も増える。
+一般に最適な値は方程式の非線形性、未知数の次元、探索領域に依存。
+
+8.4 initial_strategy（root で使用）
+
+    initial_strategy="sobol"   # 既定：準乱数列による広い配置
+    initial_strategy="random"  # 一様乱数
+    initial_strategy="grid"    # 格子状に配置
+
+高次元で grid は格子点数が急増する。実装には生成点数の上限保護がある。
+複雑な連立方程式では、最初は sobol を使うのが手軽。
+
+8.5 seed（sobol / random の再現性）
+
+    seed=0        # 既定
+    seed=42
+    seed=None
+
+同じ seed を指定すると初期値配置の再現性を保ちやすい。
+ただし数値計算の結果まで、すべての環境で厳密に同じとは限らない。
+
+8.6 unique_tol（解の重複判定）
+
+    unique_tol=1e-6
+
+それぞれの変数について、候補解どうしの絶対差がこの値以下なら
+同じ解とみなす。
+
+未知数ごとに異なる許容差も設定できる：
+
+    unique_tol=[0.01, 0.05]
+
+x=[alpha, de] を度単位で使うなら、
+最初の0.01は迎角0.01度、後ろの0.05は舵角0.05度を意味する。
+
+全要素は正の有限数である必要がある（0は不可）。
+これは解の重複除去用であって、収束判定用ではない。
+
+8.7 root_method と root_options
+
+solve_multiple_roots(method="root") では内部で solver.solve() を繰り返す。
+使用する root の種類は EquationSolver(root_method="hybr") 側で設定。
+
+    solver = EquationSolver(
+        root_method="hybr",
+        root_options={"maxfev": 1000},
+    )
+
+8.8 全解発見の保証はない
+
+- 数値探索なので、根が存在しても発見できないことがある。
+- 別の seed、より大きい n_starts、異なる探索範囲を試す。
+- 1元 brentq は符号変化の有無に依存する。
+- 補間関数を使う場合、反復途中でデータ範囲外を評価することがある。
+
+
+======================================================================
+9. constraints：不等式制約の全指定形式
+======================================================================
+
+9.1 基本ルール
+
+    c_i(x) >= -constraint_tol
+
+constraints に指定する各値は「0以上で満足」となるように定義。
+既定の constraint_tol は 1e-6 なので、微小な負値は許容する。
+制約を省略する、None を指定する、または [] を指定すれば
+従来どおり制約なしで求根する。
+
+9.2 1つの関数で複数の制約値を返す
+
+    def constraints_eqs(x):
+        alpha, de = x
+        return [
+            14.0 - alpha,       # alpha <= 14
+            25.0 - abs(de),    # |de| <= 25
+        ]
+
+    result = solver.solve(
+        func=trim_equations,
+        x0=[3, -2],
+        constraints=constraints_eqs,
+    )
+
+ここで trim_equations はユーザーが事前定義した連立方程式。
+
+9.3 lambda式のリスト
+
+    constraints=[
+        lambda x: 14.0 - x[0],
+        lambda x: 25.0 - abs(x[1]),
+    ]
+
+9.4 1つの lambda が配列を返す
+
+    constraints=lambda x: [
+        14.0 - x[0],
+        25.0 - abs(x[1]),
+    ]
+
+9.5 複数の関数をリスト・タプルで指定
+
+    def limit_alpha(x):
+        return 14.0 - x[0]
+
+    def limit_de(x):
+        return 25.0 - abs(x[1])
+
+    constraints=[limit_alpha, limit_de]
+    # constraints=(limit_alpha, limit_de) でもよい
+
+9.6 関数と lambda を混在させる
+
+    constraints=[
+        limit_alpha,
+        lambda x: 25.0 - abs(x[1]),
+    ]
+
+1つの関数が複数値を返してもよい。
+返り値は数値スカラー、リスト、タプル、または1次元 NumPy配列。
+各関数の制約値が指定順に連結される。
+
+9.7 不等号の変換
+
+条件                        constraints に渡す値
+---------------------------------------------------------------------
+x[0] <= 10                  lambda x: 10 - x[0]
+x[0] >= 0                   lambda x: x[0]
+x[1] >= -25                 lambda x: x[1] + 25
+n <= x[1] <= m              [lambda x: x[1]-n, lambda x: m-x[1]]
+abs(x[1]) <= 25             lambda x: 25 - abs(x[1])
+h(x) <= 0                   lambda x: -h(x)
+a(x) >= 0                   lambda x: a(x)
+
+注意：「<」や「>」の数学的な厳密不等号は、この実装では直接区別しない。
+許容差を使って c(x) >= -constraint_tol で判定するため、必要なら
+安全余裕（マージン）を制約式に組み込むこと。
+
+例：alpha を 14 度より 0.5 度小さく制限したいとき
+
+    constraints=lambda x: 13.5 - x[0]
+
+9.8 複数解探索に制約を追加
+
+    results = solver.solve_multiple_roots(
+        func=lambda x: (x-1)*(x-3)*(x-5),
+        bounds=[(0, 6)],
+        constraints=lambda x: 3 - x,
+    )
+    # x=1,3 を採用し、x=5 を棄却
+
+9.9 制約を指定した場合のタイミングと戻り値
+
+重要：制約は「方程式に収束した後」のみ評価する。
+
+solve()：
+    方程式は収束し、制約も満たす → converged=True, x=解
+    方程式は収束し、制約違反      → converged=False, x=nan
+                                      last_x に棄却された解を記録
+                                      constraint_values に制約値を記録
+    方程式そのものが未収束        → 制約は通常評価されない
+
+solve_multiple_roots()：
+    制約を満たした解のみ結果リストに入れる。
+    制約違反の候補は含めない。
+    すべて棄却された場合は []。
+
+9.10 制約に関する重要な注意
+
+- root / brentq の反復途中は制約条件を満たすとは限らない。
+- bounds も反復途中の厳密制約ではない。
+- 制約関数が NaN/Inf を返した候補は、不適合と判定される。
+- 制約関数の返り値に None、真偽値、空配列、2次元以上の配列を
+  指定した場合は入力形式のエラーになる。
+- constraint_tol はすべての制約に共通で、各制約の単位で解釈される。
+  次元が違う制約を併用するなら、正規化を検討。
+- args は constraints に自動では渡されない（次章参照）。
+
+
+======================================================================
+10. args：方程式に追加する固定パラメータ
+======================================================================
+
+10.1 役割
+
+未知数 x と、飛行条件・物理定数等の固定パラメータを分ける。
+未知数は root が変化させるが、args は呼び出し中に固定される。
+
+    def f(x, a, b):
+        return a * x - b
+
+    result = solver.solve(
+        func=f,
+        x0=1.0,
+        args=(2.0, 6.0),
+    )
+    # 内部では f(x, 2.0, 6.0) を評価
+    # 求まる解は x=3
+
+10.2 1個だけ渡す場合
+
+    args=(0.5,)   # 正しい1要素タプル
+    args=(0.5)    # タプルでなく数値になるため不可
+
+args=() は追加引数なし。
+args は必ず tuple（タプル）で指定する。
+
+10.3 func をリストで指定した場合
+
+    def f(x, a, b):
+        return x[0] + x[1] - a
+
+    def g(x, a, b):
+        return x[0] - x[1] - b
+
+    result = solver.solve(
+        func=[f, g],
+        x0=[0, 0],
+        args=(3.0, 1.0),
+    )
+
+この場合、すべての方程式に同じ args が渡される。
+    f(x, 3.0, 1.0)
+    g(x, 3.0, 1.0)
+
+関数ごとに異なる引数を使いたいなら、不要な引数を受け取る設計にするか、
+lambda や別関数で必要な値だけを選択して渡す。
+
+10.4 constraints に args は渡されない
+
+    limit = 14.0
+
+    def constraint(x):
+        return limit - x[0]
+
+    result = solver.solve(
+        func=[f, g],
+        x0=[0, 0],
+        args=(3.0, 1.0),
+        constraints=constraint,
+    )
+
+制約関数は constraint(x) の形で呼ばれる。
+したがって、制約にパラメータが必要なら外側の変数または lambda を使う。
+
+    alpha_limit = 14.0
+    constraints = lambda x: alpha_limit - x[0]
+
+    # または引数を固定する：
+    def alpha_constraint(x, alpha_limit):
+        return alpha_limit - x[0]
+
+    constraints = lambda x: alpha_constraint(x, 14.0)
+
+
+======================================================================
+11. EquationResult：返り値の全項目
+======================================================================
+
+solve() の戻り値は EquationResult。
+solve_multiple_roots() は、その EquationResult のリスト。
+
+属性                   意味
+---------------------------------------------------------------------
+x                      有効な解。1元ならfloat、多元ならNumPy配列。
+                       未収束／制約違反なら NaN（多元は全要素NaN）。
+residual               最後に計算した残差。1元ならfloat、
+                       多元なら1次元NumPy配列。
+converged              True=採用できる解、False=未収束／制約違反。
+method                 使用した方式（例 "brentq", "root/hybr"）。
+message                収束・未収束・制約違反の説明。
+function_calls         関数評価回数。取得できない場合はNone。
+iterations             反復回数。取得できない場合はNone。
+last_x                 失敗時の最終推定値、または制約で棄却した
+                       収束解。利用不可ならNone。
+initial_x              複数解のroot探索で、その解を発見した初期値。
+                       それ以外では通常None。
+search_bracket         複数解のbrentq探索で、根を挟んだ区間。
+                       格子点で根が厳密に0の場合などはNone。
+constraint_values      実際に評価した制約の数値タプル。
+                       制約なし／制約未評価はNone。
+residual_norm          残差の最大絶対値（読み取り専用のproperty）。
+                       非有限成分があればNaN。
+
+使用例：
+
+    result = solver.solve(
+        func=lambda x: x**2 - 4,
+        bracket=(0, 3),
+    )
+
+    if result.converged:
+        print("解:", result.x)
+        print("残差:", result.residual)
+        print("最大残差:", result.residual_norm)
+    else:
+        print("失敗:", result.message)
+        print("最後に評価した値:", result.last_x)
+
+複数解探索：
+
+    results = solver.solve_multiple_roots(
+        func=lambda x: (x-1)*(x-3)*(x-5),
+        bounds=[(0, 6)],
+    )
+
+    for i, result in enumerate(results, 1):
+        print(i, result.x, result.residual, result.constraint_values)
+
+注意：function_calls は複数解探索の全試行合計とは限らない。
+      各結果に採用された求根試行の情報を表す。
+      一部の経路で iterations が None なのは正常。
+
+
+======================================================================
+12. エラー・NaN・未収束の扱い
+======================================================================
+
+12.1 数値的な失敗
+
+例：
+- 初期値 x0 に NaN/Inf が含まれる。
+- bracket の端点が NaN/Inf。
+- 方程式の残差が評価中に NaN/Inf になる。
+- brentq の端点が同符号で根を挟めない。
+- 求根法が収束しない、または残差が residual_tol を超える。
+- 方程式に収束しても制約に違反する。
+
+solve()：原則として
+    result.converged = False
+    result.x = np.nan（多変数なら全成分NaN）
+で表す。raise_on_failure=True なら ConvergenceError。
+
+solve_multiple_roots()：失敗した試行は採用せず、成功した候補のみ返す。
+どれも採用できなければ []。
+
+12.2 引数の指定ミス・プログラム上のエラー
+
+例：
+- x0 と bracket の同時指定、両方未指定。
+- 方程式の残差数と未知数の数が一致しない。
+- func=[f, 1] のように関数でない要素がある。
+- args が tuple でない。
+- bounds の形が不適切、下限 >= 上限。
+- 多変数で method="brentq" を指定する。
+- constraints が返す形式が不正。
+
+このような指定ミスは ValueError / TypeError 等を発生させる。
+「数値的に求根できなかったこと」と「コードの指定ミス」を区別する。
+
+12.3 ユーザーの関数自体が例外を出す場合
+
+例えば CL の評価中に ValueError が起きた場合、
+その例外が必ず自動的に NaN の失敗結果へ変換されるわけではない。
+必要ならユーザー側の補間・データ範囲外処理を整える。
+
+12.4 solve_multiple_roots() が [] の意味
+
+[] は「この探索では採用できる解を発見しなかった」。
+数学的に解が存在しないことの証明ではない。
+探索の失敗、範囲外への収束、制約不適合のいずれでも [] になる。
+
+12.5 収束判定を必ず確認する
+
+    result = solver.solve(...)
+    if not result.converged:
+        print(result.message)
+        # result.x の NaN を後続計算にそのまま使わない
+
+    results = solver.solve_multiple_roots(...)
+    if len(results) == 0:
+        print("探索条件を再検討")
+
+
+======================================================================
+13. 航空機トリム計算の例（単一解と複数解）
+======================================================================
+
+未知数：
+    x[0] = alpha  [deg]
+    x[1] = de     [deg]
+
+方程式：
+    CL(alpha, de, Mach) - CL_required = 0
+    Cm(alpha, de, Mach) = 0
+
+制約：
+    alpha <= alpha_stall
+    CL <= CLmax
+    |de| <= 25 deg
+
+以下のCL, Cmは使用方法を説明するための仮想的な線形モデル。
+実機の空力特性や失速特性を表すものではない。
+
+    from utils.solvers import EquationSolver
+
+    def CL(alpha, de, Mach):
+        return 0.08*alpha + 0.005*de + 0.12*(1.0 - Mach)
+
+    def Cm(alpha, de, Mach):
+        return 0.06 - 0.012*alpha - 0.03*de
+
+    # 方程式は func=[f, g] として渡す
+    def lift_eq(x, Mach, CL_required):
+        alpha, de = x
+        return CL(alpha, de, Mach) - CL_required
+
+    def moment_eq(x, Mach, CL_required):
+        alpha, de = x
+        return Cm(alpha, de, Mach)
+
+    Mach = 0.4
+    CL_required = 0.5
+    alpha_stall = 14.0
+    CLmax = 1.3
+
+    # 1つの制約関数から3本の制約式を返す
+    def trim_constraints(x):
+        alpha, de = x
+        return [
+            alpha_stall - alpha,
+            CLmax - CL(alpha, de, Mach),
+            25.0 - abs(de),
+        ]
+
+    solver = EquationSolver(
+        root_method="hybr",
+        tol=1e-10,
+        residual_tol=1e-8,
+    )
+
+    # A. 単一解を求める（x0 から探索）
+    one = solver.solve(
+        func=[lift_eq, moment_eq],
+        x0=[5.0, 0.0],
+        args=(Mach, CL_required),
+        constraints=trim_constraints,
+    )
+
+    print("単一解:", one.x, one.converged)
+
+    # B. 探索領域内の複数解を探す
+    many = solver.solve_multiple_roots(
+        func=[lift_eq, moment_eq],
+        bounds=[
+            (-5.0, 20.0),    # alpha [deg]
+            (-25.0, 25.0),    # de [deg]
+        ],
+        method="root",
+        n_starts=200,
+        initial_strategy="sobol",
+        unique_tol=[0.01, 0.01],
+        args=(Mach, CL_required),
+        constraints=trim_constraints,
+        constraint_tol=1e-6,
+        seed=0,
+    )
+
+    for k, r in enumerate(many, 1):
+        if r.converged:
+            alpha, de = r.x
+            print(f"解{k}: alpha={alpha:.6f} deg, de={de:.6f} deg")
+            print("残差:", r.residual)
+            print("制約値:", r.constraint_values)
+
+上記の仮想モデルは線形方程式なので、通常は1つの解になる。
+多解の可能性を確認したい場合にも solve_multiple_roots() を使用できるが、
+解が複数存在するかどうかは元の方程式の構造に依存する。
+
+【空力の注意】
+- CL <= CLmax だけでは「失速前の解」と判定できない。
+  失速後に CL が低下して CLmax 以下になる場合があるため、
+  alpha_stall 等の条件を別途使う必要がある。
+- 実際の失速迎角はMach、形態、舵角等に依存し得る。
+- 上記の alpha_stall、CLmax は簡易説明用の定数。
+- もし補間関数が定義域外を受け付けないなら、
+  root の途中で定義域外を評価し得ることに注意する。
+- 制約付きでも求根途中の値は制限されない。
+
+
+======================================================================
+14. 実務上の注意とチェックリスト
+======================================================================
+
+実行前に確認する項目：
+
+[ ] 未知数の順番が x, x0, bounds, func, constraints で一致している。
+[ ] n未知数なら、func の残差を合計 n 個返す。
+[ ] 単一変数の func はスカラーを返す。
+[ ] 変数や残差の単位（deg/rad、係数など）を統一している。
+[ ] args は tuple で指定し、すべての方程式の引数仕様と一致している。
+[ ] constraints に args は自動で渡らないことを理解している。
+[ ] 制約式は「0以上で採用」に変換している。
+[ ] 制約条件は反復中の探索点を制限しないことを理解している。
+[ ] 単一解では converged をチェックしている。
+[ ] 複数解では空リスト [] の扱いを決めている。
+[ ] residual_tol と unique_tol を混同していない。
+[ ] root の複数解探索では、n_starts や seed を変えて頑健性を確認する。
+[ ] 1元 brentq では、符号が変わらない根を見逃し得ると理解している。
+[ ] 補間関数を使う場合、定義域外やNaNの扱いを確認している。
+
+
+======================================================================
+15. 短いコピー用レシピ
+======================================================================
+
+15.1 1元の1解（区間指定）
+
+    r = solver.solve(lambda x: x**2 - 4, bracket=(0, 3))
+
+15.2 1元の1解（初期値指定）
+
+    r = solver.solve(lambda x: x**2 - 4, x0=1.0)
+
+15.3 1元の複数解
+
+    rs = solver.solve_multiple_roots(
+        lambda x: (x-1)*(x-3)*(x-5),
+        bounds=[(0, 6)], scan_points=120,
+    )
+
+15.4 2元連立の1解（lambdaリスト）
+
+    r = solver.solve(
+        func=[lambda x: x[0]+x[1]-3,
+              lambda x: x[0]-x[1]-1],
+        x0=[0, 0],
+    )
+
+15.5 2元連立の複数解（lambdaリスト）
+
+    rs = solver.solve_multiple_roots(
+        func=[lambda x: x[0]**2-1,
+              lambda x: x[1]**2-4],
+        bounds=[(-2, 2), (-3, 3)],
+        n_starts=200,
+    )
+
+15.6 2元連立の複数解（制約を追加）
+
+    rs = solver.solve_multiple_roots(
+        func=[lambda x: x[0]**2-1,
+              lambda x: x[1]**2-4],
+        bounds=[(-2, 2), (-3, 3)],
+        n_starts=200,
+        constraints=lambda x: [x[0], x[1]],  # x[0]>=0, x[1]>=0
+    )
+
+15.7 制約の書き方のバリエーション
+
+    # 1関数が2制約を返す
+    constraints = lambda x: [10 - x[0], x[1]]
+
+    # 個別のlambda式を並べる
+    constraints = [lambda x: 10 - x[0], lambda x: x[1]]
+
+    # 関数のリスト
+    def c1(x): return 10 - x[0]
+    def c2(x): return x[1]
+    constraints = [c1, c2]
+
+    # 制約なし（いずれも可）
+    constraints = None
+    constraints = []
+    # または constraints 引数自体を省略
+
+
+======================================================================
+16. ソースコード上の根拠
+======================================================================
+
+このガイドは、次の実装（AircraftPerformance v19）を直接参照して作成。
+
+  AircraftPerformance/src/utils/solvers.py
+
+主な確認先：
+  EquationSolver.__init__       root_method / tol / residual_tol / maxiter 等
+  EquationSolver._normalize_equations
+                               func=関数 または func=[f,g] の正規化
+  EquationSolver._scalar_output
+                               1元のスカラー残差の検査
+  EquationSolver._vector_output
+                               多元の残差数と shape の検査
+  EquationSolver.solve         1解の求根、brentq / root、失敗時の扱い
+  EquationSolver.solve_multiple_roots
+                               複数解探索、引数の既定値、採否・整列
+  EquationSolver._multi_starts 初期値生成（sobol/random/grid）
+  EquationSolver._unique_multi_root
+                               重複解の判定
+  EquationSolver._validate_constraints
+                               制約形式と許容値の検査
+  EquationSolver._apply_constraints
+                               収束後の制約判定
+  EquationResult               結果項目と residual_norm
+  ConvergenceError             raise_on_failure=True の例外
+
+本ガイドは「solvers.py の使用方法」に限定した説明資料。
+補間・Plotly・その他の性能計算コードの説明は含まない。
+
+======================================================================
+                          以上
+======================================================================
