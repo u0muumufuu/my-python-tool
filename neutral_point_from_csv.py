@@ -20,6 +20,9 @@ import re
 import numpy as np
 import pandas as pd
 
+# Excelへの書き込みは共通関数を使用する。
+from uitls.excel_io import write_excel_result
+
 
 # ============================================================================
 # 1. 設定：変更するのは基本的にここだけ
@@ -260,10 +263,17 @@ def save_excel(tables: dict, path: Path) -> None:
         # この領域は出力専用にする（隣接する手入力データにも注意）。
         sheet.range("A1").current_region.clear_contents()
 
-        # NaN（算出不能や欠測点）はExcelでは空白セルにする。
-        # 列名も含めて一括で書き込み、余計なDataFrameのindexは出力しない。
-        values = table.astype(object).where(pd.notna(table), None).values.tolist()
-        sheet.range("A1").value = [table.columns.tolist()] + values
+        # 列名とデータを一つの2次元リストにまとめる。
+        # DataFrameのindexは出力しない。欠損値はnp.nanに統一する。
+        # None（空白）に置換すると共通関数がNaNを検出できなくなるので注意。
+        values = [table.columns.tolist()] + table.to_numpy(
+            dtype=object, na_value=np.nan
+        ).tolist()
+
+        # 共通関数で数値・文字列を一括出力する。
+        # NaNや±infのセルだけに数式 =NA() が設定され、Excel上は#N/Aとなる。
+        # Python側の計算結果やDataFrameは変更されない。
+        write_excel_result(sheet, "A1", values)
 
     # 既存ファイルはそのまま保存。新規ファイルには指定パスで名前を付ける。
     if path.exists():

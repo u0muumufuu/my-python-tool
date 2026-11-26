@@ -10,6 +10,8 @@ python neutral_point_from_csv.py
 
 設定はPythonファイル冒頭の「1. 設定」に集約しています。
 
+添付の共通関数 `uitls/excel_io.py` を使用します。フォルダ名は指定どおり `uitls` としています。実際のフォルダ名が `utils` の場合は、Python本体のimport文を `from utils.excel_io import write_excel_result` に変更してください。共通関数の本体は添付されたものから変更していません。
+
 ## 入力
 `aero_csv` フォルダにMach別のCSVを保存します。
 ファイル名の例：`aircraft_Mach0.3_aero.csv`。
@@ -40,7 +42,7 @@ x_NP = X_REF + ((Z_NP-Z_REF)*CA_alpha-C_CM*Cm_alpha)/CN_alpha
 h_NP = 0.25 + (x_NP-X_MAC_25)/C_MAC
 x_NP_over_L = x_NP/L_FUSELAGE
 ```
-局所微係数は `np.gradient(..., edge_order=2)`、代表微係数は指定範囲での `np.polyfit(..., 1)` による最小二乗直線の傾きです。CN_alphaがしきい値未満の絶対値の場合は算出不能とし、Excelでは空白にします。
+局所微係数は `np.gradient(..., edge_order=2)`、代表微係数は指定範囲での `np.polyfit(..., 1)` による最小二乗直線の傾きです。CN_alphaがしきい値未満の絶対値の場合は算出不能とし、Excelでは数式 `=NA()` を設定して `#N/A` と表示します。
 
 ## Excel出力
 | シート | 内容 |
@@ -50,11 +52,14 @@ x_NP_over_L = x_NP/L_FUSELAGE
 | x_NP_over_L | 胴体長基準の無次元位置 [-] |
 | NP_representative | Machごとの代表中立点3種類、%MAC、近似条件、微係数 |
 
-最初の3シートはA列がalpha（度）、B列以降がMach別データです。迎角やMachは昇順。欠測は補間せず空白にします。ExcelでXY散布図を作成してください。
+最初の3シートはA列がalpha（度）、B列以降がMach別データです。迎角やMachは昇順。欠測は補間せず `=NA()` を設定します。NaNと±infは4シートすべてで同じ扱いです。入力CSV自体の欠損・無限大は従来どおりエラーとします。ExcelでXY散布図を作成してください。
 
 同名ブックがあればxlwingsで開くか接続し、同名シートを更新します。存在しないシートは末尾に追加します。既存シートの順序は変更しません。対象シートのA1を含む連続データ領域（current_region）の内容を消去してから新データを書き込みます。この範囲は出力専用とし、手入力の表や数式を隣接させないでください。シート・書式・グラフ自体は削除しませんが、グラフの参照範囲は自動変更しません。行数・列数が変化する場合は確認してください。既存ファイルは上書き保存し、Excelは開いたままにします。開いているブックの他の未保存変更も保存されるため注意してください。大切なブックはバックアップしてから実行してください。
 
 ## テスト
-`python test_neutral_point.py` で、数値計算・CSV読み込み・表変換・新規/既存Excelの呼び出しを確認できます。8項目が合格済みです。ただし、作成環境にはExcelとxlwingsがないため、Excel操作は模擬オブジェクトによる検証であり、実際のExcelでの保存・更新は未検証です。
+`python test_neutral_point.py` で、数値計算・CSV読み込み・表変換・新規/既存Excelの呼び出しを確認できます。9項目が合格済みです。ただし、作成環境にはExcelとxlwingsがないため、Excel操作は模擬オブジェクトによる検証であり、実際のExcelでの保存・更新は未検証です。
 
 xlwingsの参照： https://docs.xlwings.org/en/stable/api/book.html
+
+## 共通Excel書き込み関数の注意
+欠損セルごとに数式を設定するため、大量の欠損があると遅くなることがあります。また、共通関数単体ではNoneやpandas.NAはNA()になりません。今回の呼び出しではDataFrameの欠損をnp.nanに統一して渡しています。
