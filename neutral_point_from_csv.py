@@ -1,4 +1,4 @@
-"""マッハ数別の空力係数CSVから、局所中立点と代表中立点を計算する。
+"""マッハ数別の空力係数CSVから、局所中立点と代表中立点を計算し、Excelに出力する。
 
 入力CSVの例（1行目は読み飛ばす。迎角の単位は度）:
     aircraft_Mach0.3_aero.csv
@@ -11,6 +11,7 @@
 位置座標: 機首原点、x=機尾方向正、y=右翼方向正、z=上方向正
 空力係数: CA=機尾方向正、CN=上方向正、Cm=機首上げ正
 
+必要ライブラリ: numpy, pandas, xlwings（デスクトップ版Excelが必要）
 実行: python neutral_point_from_csv.py
 """
 from pathlib import Path
@@ -25,8 +26,12 @@ import pandas as pd
 # ============================================================================
 
 INPUT_DIR = Path(__file__).resolve().parent / "aero_csv"
-OUTPUT_LOCAL_CSV = Path(__file__).with_name("neutral_point_result.csv")
-OUTPUT_REP_CSV = Path(__file__).with_name("neutral_point_representative.csv")
+# 同名のExcelが存在する場合は更新、なければ新規作成する。
+OUTPUT_EXCEL = Path(__file__).with_name("neutral_point_result.xlsx")
+
+# 出力先シート名。既存ブックのシート名に合わせて変更してもよい。
+# 各シートのA1から始まる表を上書きする（グラフ、書式、他シートは削除しない）。
+SHEET_NAMES = ("x_NP", "h_NP", "x_NP_over_L", "NP_representative")
 
 # 入力Cmのモーメント基準点 [m]
 X_REF = 0.25
@@ -37,10 +42,13 @@ Z_REF = 0.0
 Z_NP = 0.05
 Y_NP = Y_REF
 
-# MAC前縁のx座標、MAC長、およびCmを無次元化した基準長 [m]
-X_MAC_LE = 0.0
+# 25% MACのx座標とMAC長 [m]
+X_MAC_25 = 0.25
 C_MAC = 1.0
-C_CM = C_MAC
+C_CM = C_MAC  # Cmの無次元化に用いた基準長 [m]
+
+# 胴体長 [m]：以下はサンプル値。実機の値に変更する。
+L_FUSELAGE = 5.0
 
 # 代表中立点を求める直線近似の迎角範囲 [deg]
 FIT_ALPHA_MIN_DEG = -2.0
@@ -97,21 +105,16 @@ def load_mach_csvs(folder: Path) -> pd.DataFrame:
 
         # ファイル名からMachを設定し、必要な列を数値に変換する。
         df["Mach"] = mach_from_filename(path.name)
-        for col in ["alpha", "CA", "CN", "Cm"] + (["Re"] if "Re" in df else []):
+        for col in ["alpha", "CA", "CN", "Cm"]:
             df[col] = pd.to_numeric(df[col], errors="raise")
         if not np.isfinite(df[["alpha", "CA", "CN", "Cm"]].to_numpy()).all():
             raise ValueError(f"{path.name}: 空力データに欠損値または無限大があります")
-        if "Re" in df and not np.isfinite(df["Re"].to_numpy()).all():
-            raise ValueError(f"{path.name}: Reに欠損値または無限大があります")
 
         df["source_file"] = path.name
-        frames.append(df[["Mach", "alpha", "CA", "CN", "Cm"]
-                         + (["Re"] if "Re" in df else []) + ["source_file"]])
+        frames.append(df[["Mach", "alpha", "CA", "CN", "Cm", "source_file"]])
 
     if not frames:
         raise FileNotFoundError(f"{folder}: Machを含むCSVが見つかりません")
-    if any("Re" in f for f in frames) and not all("Re" in f for f in frames):
-        raise ValueError("Re列を使う場合は、すべてのCSVにRe列が必要です")
     return pd.concat(frames, ignore_index=True)
 
 
@@ -126,18 +129,17 @@ def calculate_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
     中立点で Cm_alpha=0 と置くと、
     x_NP = x_ref + [(z_NP-z_ref)*CA_alpha - C_CM*Cm_alpha]/CN_alpha
     """
-    if C_MAC <= 0 or C_CM <= 0:
-        raise ValueError("C_MACとC_CMは正の値にしてください")
+    if not all(np.isfinite(v) and v > 0 for v in (C_MAC, C_CM, L_FUSELAGE)):
+        raise ValueError("C_MAC、C_CM、L_FUSELAGEは有限の正の値にしてください")
 
-    group_cols = ["Mach"] + (["Re"] if "Re" in data else [])
-    if data.duplicated(group_cols + ["alpha"]).any():
-        raise ValueError("同じMach・Re・迎角のデータが重複しています")
+    if data.duplicated(["Mach", "alpha"]).any():
+        raise ValueError("同じMach・迎角のデータが重複しています")
 
     results = []
-    for _, group in data.sort_values(group_cols + ["alpha"]).groupby(group_cols):
+    for _, group in data.sort_values(["Mach", "alpha"]).groupby("Mach"):
         g = group.copy()
         if len(g) < 3:
-            raise ValueError("各Mach・Reで迎角データが3点以上必要です")
+            raise ValueError("各Machで迎角データが3点以上必要です")
 
         # 迎角を度からradへ変換。刻みが不等間隔でも差分可能。
         alpha_rad = np.deg2rad(g["alpha"].to_numpy())
@@ -158,7 +160,10 @@ def calculate_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
         g["x_np_m"] = x_np
         g["y_np_m"] = Y_NP  # y,zは指定値。空力係数から求めていない。
         g["z_np_m"] = Z_NP
-        g["h_np"] = (x_np - X_MAC_LE)/C_MAC
+        # MAC前縁からの位置をMAC長で割る。25% MACを起点としても同じ結果。
+        g["h_np"] = 0.25 + (x_np - X_MAC_25)/C_MAC
+        # 機首原点のx座標を胴体長で無次元化する。
+        g["x_np_over_L"] = x_np / L_FUSELAGE
         g["h_np_percent"] = g["h_np"]*100
         results.append(g)
 
@@ -171,9 +176,8 @@ def calculate_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_representative_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
     """空力係数を迎角に対して直線近似し、Machごとの代表中立点を求める。"""
-    group_cols = ["Mach"] + (["Re"] if "Re" in data else [])
     results = []
-    for _, group in data.groupby(group_cols):
+    for mach, group in data.groupby("Mach"):
         g = group[group["alpha"].between(FIT_ALPHA_MIN_DEG, FIT_ALPHA_MAX_DEG)]
         if len(g) < 3:
             raise ValueError(f"Mach={group['Mach'].iloc[0]}: 直線近似範囲に迎角3点以上が必要です")
@@ -186,8 +190,8 @@ def calculate_representative_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
 
         x_np = (np.nan if abs(cn_a) < MIN_ABS_CN_ALPHA else
                 X_REF + ((Z_NP - Z_REF)*ca_a - C_CM*cm_a)/cn_a)
-        h_np = (x_np - X_MAC_LE)/C_MAC
-        row = {col: g[col].iloc[0] for col in group_cols}
+        h_np = 0.25 + (x_np - X_MAC_25)/C_MAC
+        row = {"Mach": mach}
         row.update({
             "fit_alpha_min_deg": FIT_ALPHA_MIN_DEG,
             "fit_alpha_max_deg": FIT_ALPHA_MAX_DEG,
@@ -199,6 +203,7 @@ def calculate_representative_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
             "y_np_m": Y_NP,
             "z_np_m": Z_NP,
             "h_np": h_np,
+            "x_np_over_L": x_np / L_FUSELAGE,
             "h_np_percent": h_np*100,
         })
         results.append(row)
@@ -207,18 +212,79 @@ def calculate_representative_neutral_points(data: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================================
-# 5. 実行
+# 5. Excel出力：横持ち形式に変換して4シートに保存
+# ============================================================================
+
+def make_excel_tables(local: pd.DataFrame, representative: pd.DataFrame) -> dict:
+    """迎角を行、Machを列にしたグラフ用の表を作る。"""
+    tables = {}
+    for name, column in zip(SHEET_NAMES[:3], ["x_np_m", "h_np", "x_np_over_L"]):
+        # pivot: 縦持ちの計算結果を横持ちに変換する。
+        table = local.pivot(index="alpha", columns="Mach", values=column)
+        table = table.sort_index().sort_index(axis=1)
+        table.columns = [f"Mach{m:g}" for m in table.columns]
+        tables[name] = table.reset_index()
+
+    # 代表中立点はMachごとに1行。3種類の位置と近似条件を併記する。
+    tables[SHEET_NAMES[3]] = representative[[
+        "Mach", "x_np_m", "h_np", "x_np_over_L", "h_np_percent",
+        "fit_alpha_min_deg", "fit_alpha_max_deg", "n_fit_points",
+        "CA_alpha_per_rad", "CN_alpha_per_rad", "Cm_alpha_per_rad",
+    ]].sort_values("Mach")
+    return tables
+
+
+def save_excel(tables: dict, path: Path) -> None:
+    """Excelを新規作成、または既存の同名シートを更新する。"""
+    import xlwings as xw  # 計算だけのテストではExcelを必要としない。
+
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # xw.Bookは既存ブックが開いていれば接続し、なければ開く。
+    # 新規ブックの場合は初期シートを再利用する。
+    if path.exists():
+        book = xw.Book(str(path))
+    else:
+        book = xw.Book()
+        book.sheets[0].name = next(iter(tables))
+
+    for name, table in tables.items():
+        if name in [s.name for s in book.sheets]:
+            sheet = book.sheets[name]
+        else:
+            sheet = book.sheets.add(name, after=book.sheets[-1])
+
+        # A1から始まる旧データ表だけを消去する。
+        # clear_contentsはセルの書式やグラフを削除しない。
+        # 古いMach列や迎角行が残らないようにしてから書き込む。
+        # この領域は出力専用にする（隣接する手入力データにも注意）。
+        sheet.range("A1").current_region.clear_contents()
+
+        # NaN（算出不能や欠測点）はExcelでは空白セルにする。
+        # 列名も含めて一括で書き込み、余計なDataFrameのindexは出力しない。
+        values = table.astype(object).where(pd.notna(table), None).values.tolist()
+        sheet.range("A1").value = [table.columns.tolist()] + values
+
+    # 既存ファイルはそのまま保存。新規ファイルには指定パスで名前を付ける。
+    if path.exists():
+        book.save()
+    else:
+        book.save(str(path))
+    # 結果をすぐ確認できるよう、Excelは閉じずに残す。
+
+
+# ============================================================================
+# 6. 実行
 # ============================================================================
 
 def main() -> None:
     data = load_mach_csvs(INPUT_DIR)
     local = calculate_neutral_points(data)
     representative = calculate_representative_neutral_points(data)
-    local.to_csv(OUTPUT_LOCAL_CSV, index=False, encoding="utf-8-sig")
-    representative.to_csv(OUTPUT_REP_CSV, index=False, encoding="utf-8-sig")
-    print(f"局所中立点: {OUTPUT_LOCAL_CSV}")
-    print(f"代表中立点: {OUTPUT_REP_CSV}")
-    print(representative[["Mach", "x_np_m", "h_np_percent"]].to_string(index=False))
+    tables = make_excel_tables(local, representative)
+    save_excel(tables, OUTPUT_EXCEL)
+    print(f"Excel出力完了: {OUTPUT_EXCEL}")
+    print(representative[["Mach", "x_np_m", "h_np", "x_np_over_L"]].to_string(index=False))
 
 
 if __name__ == "__main__":

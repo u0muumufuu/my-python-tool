@@ -1,104 +1,60 @@
-# 中立点算出プログラム（マッハ数別CSV対応）
+# 中立点計算プログラム（Excel出力版）
 
-`neutral_point_from_csv.py` は、**ファイル名に `Mach0.3` のようにマッハ数が記されたCSV**から、空力係数を読み込んで中立点を計算します。設定変更はPythonファイル冒頭の「1. 設定」だけで行います。
+## 実行環境
+WindowsまたはmacOSのデスクトップ版Microsoft ExcelとPythonが必要です。
 
-## フォルダ構成
-
-```text
-neutral_point_from_csv.py
-neutral_point_README.md
-aero_csv/
-    aircraft_Mach0.2_aero.csv
-    aircraft_Mach0.3_aero.csv
-    aircraft_Mach0.4_aero.csv
+```bash
+pip install numpy pandas xlwings
+python neutral_point_from_csv.py
 ```
 
-`INPUT_DIR` に指定したフォルダ内にある、ファイル名に `Mach` と数値を含むCSVを一括処理します。マッハ数は**ファイル名から抽出**し、CSV内に `Mach` 列は不要です。`Mach0.3` / `Mach1.2` / `mach0.85` などが使えます。
+設定はPythonファイル冒頭の「1. 設定」に集約しています。
 
-## 入力CSV形式
-
-例えば `aircraft_Mach0.3_aero.csv` は次のようにします。
+## 入力
+`aero_csv` フォルダにMach別のCSVを保存します。
+ファイル名の例：`aircraft_Mach0.3_aero.csv`。
+1行目を読み飛ばし、2行目をヘッダーとして読み込みます。
 
 ```csv
-この1行目は不要なので読み飛ばす
+任意の説明文
 alpha,CA,CN,Cm
 3,0.026,0.395,0.0242
 4,0.024,0.480,0.0156
 5,0.022,0.565,0.0070
-6,0.020,0.650,-0.0016
-7,0.018,0.735,-0.0102
 ```
 
-- **1行目を必ず読み飛ばし、2行目を列名として読み込みます**（`pd.read_csv(..., skiprows=1)`）。
-- 迎角列は **`alpha` のみ**です。単位は**度**。`alpha_deg` や `AoA` は使用できません。
-- 必須の空力係数は `Cm` と `CA,CN`（または `CX,CZ`）。列名は `Cm`、`CA`、`CN`（または `CX`、`CZ`）としてください。
-- `CA=-CX`（機尾方向正）、`CN=-CZ`（上方向正）。`Cm` は機首上げ正。
-- `Re` 列があれば、同じMach・Reの各グループごとに計算します。使用する場合は全CSVに`Re`列が必要です。
-- 同じMach・Re・迎角の組合せが重複している場合はエラーにします。
-- 各Mach・Reに**迎角3点以上**が必要です。
-- 入力はマッハ数ごとに別ファイルなので、同一フォルダ内に配置してください。
+- `alpha` は度。`CA,CN` の代わりに `CX,CZ` を入力した場合、符号反転します。
+- 座標は機首原点、x機尾方向正、y右翼方向正、z上方向正。CAは機尾方向正、CNは上方向正、Cmは機首上げ正。
+- 同じMach・迎角の重複はエラー。各Machに最低3迎角点が必要です。
+- Reynolds数によるグループ化は行いません。同一形態・舵角・その他の解析条件のデータを入力してください。
 
-## 設定項目
+## 設定
+`INPUT_DIR`, `OUTPUT_EXCEL` に入力フォルダと出力ブックを指定します。
+`SHEET_NAMES` は既存ブックの出力先シート名に合わせて変更可能です。
+`X_REF, Y_REF, Z_REF` はモーメント基準点、`Z_NP` は評価高さ、`X_MAC_25` は25% MAC位置、`C_MAC` はMAC長、`C_CM` はピッチモーメント係数の基準長、`L_FUSELAGE` は胴体長です（長さの単位はm）。初期値は架空のサンプル用です。
+`FIT_ALPHA_MIN_DEG`, `FIT_ALPHA_MAX_DEG` は代表中立点の直線近似範囲（度）です。
 
-Pythonファイル冒頭の「1. 設定」を編集します。
-
-```python
-INPUT_DIR = Path(__file__).resolve().parent / "aero_csv"
-
-X_REF = 0.25
-Y_REF = 0.0
-Z_REF = 0.0
-
-Z_NP = 0.05
-Y_NP = Y_REF
-
-X_MAC_LE = 0.0
-C_MAC = 1.0
-C_CM = C_MAC
-
-FIT_ALPHA_MIN_DEG = -2.0
-FIT_ALPHA_MAX_DEG = 8.0
+## 計算
 ```
-
-- **位置座標** [m]：機首原点、x=機尾正、y=右翼正、z=上正。
-- `X_REF,Y_REF,Z_REF`：入力`Cm`のモーメント基準点。
-- `Z_NP`：中立点を評価する**固定高さ**。`Y_NP`：出力する左右位置（`Cm`のみからは決まらない）。
-- `X_MAC_LE`：MAC前縁のx座標。`C_MAC`：MAC長。`C_CM`：`Cm`を無次元化した基準長。
-- `FIT_ALPHA_MIN_DEG`～`FIT_ALPHA_MAX_DEG`：代表中立点の直線近似に使う迎角範囲。**主翼・尾翼がほぼ線形に応答する範囲**を機体に合わせて設定してください。各Machで最低3点必要です。
-
-## 出力ファイル
-
-1. **`neutral_point_result.csv`（局所中立点）**：各Mach・迎角の点で、`CA,CN,Cm`を迎角で微分し中立点を計算します。内部点は中心差分、両端は3点を使う2次精度の前進・後退差分（`np.gradient(edge_order=2)`）。
-2. **`neutral_point_representative.csv`（代表中立点）**：設定した迎角範囲の`CA,CN,Cm`をそれぞれ一次回帰（`np.polyfit`）し、各Machに1つの中立点を計算します。
-
-どちらにも、`CA_alpha_per_rad,CN_alpha_per_rad,Cm_alpha_per_rad,x_np_m,y_np_m,z_np_m,h_np,h_np_percent` を記録します。局所結果には元のファイル名`source_file`も入ります。
-
-算出式は
-
-\[
-x_{NP}=x_{ref}+\frac{(z_{NP}-z_{ref})C_{A\alpha}-C_{CM}C_{m\alpha}}{C_{N\alpha}}
-\]
-
-\[
-h_{NP}=\frac{x_{NP}-x_{MAC,LE}}{C_{MAC}},\qquad \%MAC=100h_{NP}
-\]
-
-です。`C_Nα`がゼロに近い場合、計算結果はNaNになります。
-
-## 実行
-
-```bash
-pip install numpy pandas
-python neutral_point_from_csv.py
+x_NP = X_REF + ((Z_NP-Z_REF)*CA_alpha-C_CM*Cm_alpha)/CN_alpha
+h_NP = 0.25 + (x_NP-X_MAC_25)/C_MAC
+x_NP_over_L = x_NP/L_FUSELAGE
 ```
+局所微係数は `np.gradient(..., edge_order=2)`、代表微係数は指定範囲での `np.polyfit(..., 1)` による最小二乗直線の傾きです。CN_alphaがしきい値未満の絶対値の場合は算出不能とし、Excelでは空白にします。
 
-単体テストは `python test_neutral_point.py` で実行できます。
+## Excel出力
+| シート | 内容 |
+|---|---|
+| x_NP | 前後座標 [m] |
+| h_NP | MAC基準の無次元位置 [-] |
+| x_NP_over_L | 胴体長基準の無次元位置 [-] |
+| NP_representative | Machごとの代表中立点3種類、%MAC、近似条件、微係数 |
 
-## 注意事項
+最初の3シートはA列がalpha（度）、B列以降がMach別データです。迎角やMachは昇順。欠測は補間せず空白にします。ExcelでXY散布図を作成してください。
 
-- 通常の設計用の「中立点」は、多くの場合、**あるマッハ数・形態の線形迎角範囲に対して1つ**設定します。本プログラムの代表中立点がそれに相当します。
-- 高迎角・失速付近では微係数が変化するため、局所中立点を併せて確認してください。
-- `Cm` の基準点、`Cm` の基準長、`CA/CN` の符号、舵角・形態・推進状態の固定条件を揃えてください。
-- 代表中立点を求める際に、失速によって空力係数の勾配が変わる領域を不用意に含めないでください。
+同名ブックがあればxlwingsで開くか接続し、同名シートを更新します。存在しないシートは末尾に追加します。既存シートの順序は変更しません。対象シートのA1を含む連続データ領域（current_region）の内容を消去してから新データを書き込みます。この範囲は出力専用とし、手入力の表や数式を隣接させないでください。シート・書式・グラフ自体は削除しませんが、グラフの参照範囲は自動変更しません。行数・列数が変化する場合は確認してください。既存ファイルは上書き保存し、Excelは開いたままにします。開いているブックの他の未保存変更も保存されるため注意してください。大切なブックはバックアップしてから実行してください。
 
-**参考文献**：Etkin & Reid, *Dynamics of Flight: Stability and Control*, 3rd ed., Chapter 2, §2.3（書籍pp.29–31、添付PDF pp.41–43）。中立点の定義と線形近似の考え方を参照しています。
+## テスト
+`python test_neutral_point.py` で、数値計算・CSV読み込み・表変換・新規/既存Excelの呼び出しを確認できます。8項目が合格済みです。ただし、作成環境にはExcelとxlwingsがないため、Excel操作は模擬オブジェクトによる検証であり、実際のExcelでの保存・更新は未検証です。
+
+xlwingsの参照： https://docs.xlwings.org/en/stable/api/book.html
